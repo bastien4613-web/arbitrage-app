@@ -1,0 +1,1898 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Arbitrage FR" />
+<meta name="theme-color" content="#020617" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='32' fill='%23020617'/%3E%3Ccircle cx='90' cy='90' r='62' fill='%2310b981'/%3E%3Ctext x='90' y='118' text-anchor='middle' font-size='72' fill='white' font-family='Arial' font-weight='bold'%3E€%3C/text%3E%3C/svg%3E" />
+<title>Arbitrage Sportif FR — v3</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body { background:#020617; color:#f1f5f9; font-family:system-ui,-apple-system,sans-serif; padding-top:env(safe-area-inset-top); padding-bottom:env(safe-area-inset-bottom); }
+  details summary { list-style:none; cursor:pointer; }
+  details summary::-webkit-details-marker { display:none; }
+  .pulse-dot { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .scrollbar::-webkit-scrollbar { width:8px; height:8px; }
+  .scrollbar::-webkit-scrollbar-track { background:#0f172a; }
+  .scrollbar::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
+  .new-opp { animation: glow 1.5s ease-out; }
+  @keyframes glow { 0%{box-shadow:0 0 0 0 rgba(16,185,129,.7)} 100%{box-shadow:0 0 0 20px rgba(16,185,129,0)} }
+  .tab-active { color:#10b981; border-color:#10b981; }
+  .tab-inactive { color:#64748b; border-color:transparent; }
+  .conf-high { background:linear-gradient(90deg,#059669,#10b981); }
+  .conf-mid  { background:linear-gradient(90deg,#d97706,#f59e0b); }
+  .conf-low  { background:linear-gradient(90deg,#dc2626,#ef4444); }
+</style>
+</head>
+<body>
+<div id="app" class="min-h-screen p-4 md:p-6"></div>
+
+<script>
+/* ==================================================================
+   ARBITRAGE SPORTIF FR — v3 (Pro)
+   ------------------------------------------------------------------
+   Nouveautés v3 :
+    - Adaptive refresh (économie quota : -60 à -85% selon usage)
+    - CLV tracking (capture cote de fermeture pour mesurer ton skill)
+    - Money management (stop-loss journalier, mise max %, cooldown)
+    - Confidence scoring (1-10 par opportunité)
+    - O/U intelligence (variance ligne entre books, consensus)
+    - Liens recherche rapides (Sofascore, FlashScore, NBA.com)
+    - PWA (installable iPhone : Safari > Partager > Sur l'écran d'accueil)
+    - 100% rétrocompatible avec données v1/v2
+   ================================================================== */
+
+/* ====== CONFIG ====== */
+const FRENCH_BOOKMAKERS = ["betclic_fr","winamax_fr","unibet_fr","pmu_fr"];
+const BOOK_LABELS = { betclic_fr:"Betclic", winamax_fr:"Winamax", unibet_fr:"Unibet", pmu_fr:"PMU" };
+const BOOK_URLS = {
+  betclic_fr: "https://www.betclic.fr",
+  winamax_fr: "https://www.winamax.fr/paris-sportifs",
+  unibet_fr:  "https://www.unibet.fr",
+  pmu_fr:     "https://paris-sportifs.pmu.fr",
+};
+const BOOK_COLORS = {
+  betclic_fr: "bg-orange-700 text-orange-100",
+  winamax_fr: "bg-amber-600 text-amber-50",
+  unibet_fr:  "bg-emerald-700 text-emerald-100",
+  pmu_fr:     "bg-blue-700 text-blue-100",
+};
+
+/**
+ * Liste complète des sports supportés par The Odds API + dispos chez les books FR.
+ * Le champ `cat` permet de regrouper visuellement.
+ * `default_on` : true = activé d'origine (top sports), false = désactivé (à toggle manuellement
+ * pour préserver le quota — chaque sport coché = +1 req par scan).
+ *
+ * Liste de référence à jour : https://api.the-odds-api.com/v4/sports/?apiKey=TA_CLE
+ * Si un sport est hors-saison ou indisponible, l'API renvoie une 422 ignorée gracefully.
+ */
+const SPORTS = [
+  // ===== TOP — activés par défaut =====
+  { key:"basketball_nba",            label:"NBA",              cat:"Basket",      priority:1.00, emoji:"🏀", research:"nba",    default_on:true },
+  { key:"soccer_france_ligue_one",   label:"Ligue 1",          cat:"Foot Europe", priority:0.98, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_uefa_champs_league", label:"Ligue des Champions", cat:"Foot Europe", priority:1.00, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_uefa_europa_league", label:"Ligue Europa",     cat:"Foot Europe", priority:0.95, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_epl",                label:"Premier League",   cat:"Foot Europe", priority:0.95, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_spain_la_liga",      label:"La Liga",          cat:"Foot Europe", priority:0.92, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_italy_serie_a",      label:"Serie A",          cat:"Foot Europe", priority:0.90, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"soccer_germany_bundesliga", label:"Bundesliga",       cat:"Foot Europe", priority:0.90, emoji:"⚽", research:"soccer", default_on:true },
+  { key:"tennis_atp",                label:"ATP (tournois)",   cat:"Tennis",      priority:0.85, emoji:"🎾", research:"tennis", default_on:true },
+  { key:"tennis_wta",                label:"WTA (tournois)",   cat:"Tennis",      priority:0.80, emoji:"🎾", research:"tennis", default_on:true },
+
+  // ===== FOOT EUROPE supplémentaire =====
+  { key:"soccer_france_ligue_two",       label:"Ligue 2",            cat:"Foot Europe", priority:0.80, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_england_efl_champ",      label:"Championship (Eng)", cat:"Foot Europe", priority:0.82, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_england_league1",        label:"League One (Eng)",   cat:"Foot Europe", priority:0.65, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_efl_champ",              label:"EFL Cup",            cat:"Foot Europe", priority:0.75, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_fa_cup",                 label:"FA Cup",             cat:"Foot Europe", priority:0.78, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_germany_bundesliga2",    label:"Bundesliga 2",       cat:"Foot Europe", priority:0.72, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_spain_segunda_division", label:"Segunda (Esp)",      cat:"Foot Europe", priority:0.72, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_italy_serie_b",          label:"Serie B (Ita)",      cat:"Foot Europe", priority:0.70, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_portugal_primeira_liga", label:"Primeira Liga (Por)", cat:"Foot Europe", priority:0.78, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_netherlands_eredivisie", label:"Eredivisie (NL)",    cat:"Foot Europe", priority:0.78, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_belgium_first_div",      label:"Pro League (Bel)",   cat:"Foot Europe", priority:0.72, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_turkey_super_league",    label:"Süper Lig (Tur)",    cat:"Foot Europe", priority:0.75, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_greece_super_league",    label:"Super League (Gre)", cat:"Foot Europe", priority:0.65, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_uefa_nations_league",    label:"Ligue des Nations",  cat:"Foot International", priority:0.85, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_fifa_world_cup",         label:"Coupe du Monde",     cat:"Foot International", priority:1.00, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_uefa_european_championship", label:"Euro",           cat:"Foot International", priority:1.00, emoji:"⚽", research:"soccer", default_on:false },
+
+  // ===== FOOT MONDE =====
+  { key:"soccer_brazil_campeonato",      label:"Brésil Serie A",     cat:"Foot Monde", priority:0.75, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_argentina_primera_division", label:"Argentine Primera", cat:"Foot Monde", priority:0.72, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_mexico_ligamx",          label:"Liga MX (Mex)",      cat:"Foot Monde", priority:0.65, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_usa_mls",                label:"MLS (USA)",          cat:"Foot Monde", priority:0.65, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_japan_j_league",         label:"J-League (Jap)",     cat:"Foot Monde", priority:0.55, emoji:"⚽", research:"soccer", default_on:false },
+  { key:"soccer_conmebol_copa_libertadores", label:"Copa Libertadores", cat:"Foot Monde", priority:0.85, emoji:"⚽", research:"soccer", default_on:false },
+
+  // ===== US SPORTS =====
+  { key:"americanfootball_nfl",         label:"NFL",                cat:"US Sports", priority:0.95, emoji:"🏈", research:"nfl",    default_on:false },
+  { key:"americanfootball_ncaaf",       label:"NCAA Football",      cat:"US Sports", priority:0.65, emoji:"🏈", research:"nfl",    default_on:false },
+  { key:"basketball_ncaab",             label:"NCAA Basket",        cat:"US Sports", priority:0.65, emoji:"🏀", research:"nba",    default_on:false },
+  { key:"basketball_wnba",              label:"WNBA",               cat:"US Sports", priority:0.55, emoji:"🏀", research:"nba",    default_on:false },
+  { key:"basketball_euroleague",        label:"EuroLeague",         cat:"Basket",    priority:0.78, emoji:"🏀", research:"nba",    default_on:false },
+  { key:"icehockey_nhl",                label:"NHL",                cat:"US Sports", priority:0.65, emoji:"🏒", research:"nhl",    default_on:false },
+  { key:"baseball_mlb",                 label:"MLB",                cat:"US Sports", priority:0.55, emoji:"⚾", research:"mlb",    default_on:false },
+
+  // ===== COMBAT =====
+  { key:"mma_mixed_martial_arts",       label:"MMA / UFC",          cat:"Combat", priority:0.85, emoji:"🥊", research:"soccer", default_on:false },
+  { key:"boxing_boxing",                label:"Boxe",               cat:"Combat", priority:0.70, emoji:"🥊", research:"soccer", default_on:false },
+
+  // ===== RUGBY =====
+  { key:"rugbyleague_nrl",              label:"NRL (Aus)",          cat:"Rugby", priority:0.55, emoji:"🏉", research:"soccer", default_on:false },
+  { key:"rugbyunion_six_nations",       label:"Six Nations",        cat:"Rugby", priority:0.85, emoji:"🏉", research:"soccer", default_on:false },
+  { key:"rugbyunion_world_cup",         label:"Mondial Rugby",      cat:"Rugby", priority:0.95, emoji:"🏉", research:"soccer", default_on:false },
+
+  // ===== AUTRES =====
+  { key:"cricket_ipl",                  label:"IPL Cricket",        cat:"Autres", priority:0.45, emoji:"🏏", research:"soccer", default_on:false },
+  { key:"cricket_big_bash",             label:"Big Bash Cricket",   cat:"Autres", priority:0.40, emoji:"🏏", research:"soccer", default_on:false },
+  { key:"aussierules_afl",              label:"AFL Aussie Rules",   cat:"Autres", priority:0.40, emoji:"🏉", research:"soccer", default_on:false },
+  { key:"icehockey_sweden_hockey_league", label:"SHL (Suède)",      cat:"Autres", priority:0.40, emoji:"🏒", research:"nhl",    default_on:false },
+  { key:"baseball_npb",                 label:"NPB (Japon)",        cat:"Autres", priority:0.35, emoji:"⚾", research:"mlb",    default_on:false },
+  { key:"golf_pga_championship_winner", label:"PGA Championship",   cat:"Autres", priority:0.50, emoji:"⛳", research:"soccer", default_on:false },
+];
+
+// Ordre d'affichage des catégories
+const SPORT_CATEGORIES = ["Basket","Foot Europe","Foot International","Foot Monde","Tennis","US Sports","Combat","Rugby","Autres"];
+
+const MARKETS = ["h2h","totals"];
+const TOP_N = 20;
+const ODD_BUCKETS = [
+  { label:"≤1.50",     min:0,    max:1.50 },
+  { label:"1.51-2.00", min:1.50, max:2.00 },
+  { label:"2.01-3.00", min:2.00, max:3.00 },
+  { label:"3.01-5.00", min:3.00, max:5.00 },
+  { label:">5.00",     min:5.00, max:Infinity },
+];
+
+// Liens recherche par sport (gratuits, ouverts dans un nouvel onglet)
+const RESEARCH_LINKS = {
+  nba:    (q) => `https://www.nba.com/search?q=${encodeURIComponent(q)}`,
+  soccer: (q) => `https://www.flashscore.fr/recherche/?q=${encodeURIComponent(q)}`,
+  tennis: (q) => `https://www.sofascore.com/fr/recherche?q=${encodeURIComponent(q)}`,
+  nhl:    (q) => `https://www.nhl.com/search?q=${encodeURIComponent(q)}`,
+  mlb:    (q) => `https://www.mlb.com/search?q=${encodeURIComponent(q)}`,
+};
+
+/* ====== UTILS ====== */
+const r2 = n => Math.round(n*100)/100;
+const fmtEur = n => (n>=0?"+":"") + n.toFixed(2) + " €";
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+const todayISO = () => new Date().toISOString().slice(0,10);
+
+function escapeHtml(s){
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+const escapeAttr = escapeHtml;
+
+function timeUntil(iso) {
+  const ms = new Date(iso) - new Date();
+  if (ms < 0) {
+    const ago = -ms;
+    const h = Math.floor(ago/3600000), m = Math.floor((ago%3600000)/60000);
+    if (h >= 3) return `🔴 fini`;
+    if (h >= 1) return `🔴 LIVE +${h}h${m}`;
+    return `🔴 LIVE +${m}min`;
+  }
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h >= 24) return `dans ${Math.floor(h/24)}j ${h%24}h`;
+  if (h >= 1)  return `dans ${h}h ${m}min`;
+  return `dans ${m}min`;
+}
+
+const ls = (k, dflt=null) => {
+  const v = localStorage.getItem(k);
+  if (v === null) return dflt;
+  try { return JSON.parse(v); } catch { return v; }
+};
+const save = (k, v) => localStorage.setItem(k, typeof v==="string" ? v : JSON.stringify(v));
+
+/* ====== STATE ====== */
+const state = {
+  // Hérité v1/v2
+  apiKey:        ls("arb_apikey", ""),
+  stake:         Number(ls("arb_stake", 100)),
+  minArb:        Number(ls("arb_min", 0.5)),
+  notifyArb:     Number(ls("arb_notify", 2.5)),
+  urgentArb:     Number(ls("arb_urgent", 4.0)),
+  refreshSec:    Number(ls("arb_refresh", 60)),
+  ntfyTopic:     ls("arb_ntfy", ""),
+  alertsEnabled: ls("arb_alerts", true) === true,
+  soundEnabled:  ls("arb_sound", true) === true,
+  desktopNotif:  ls("arb_desktop", false) === true,
+  sortBy:        ls("arb_sort", "confidence"),
+  enabledSports: (() => {
+    const saved = ls("arb_sports", null);
+    // Premier lancement OU expansion v3.1 (nouveaux sports inconnus du LS) : défauts
+    const dflt = SPORTS.reduce((a,s)=>(a[s.key]=s.default_on,a),{});
+    if (!saved) return dflt;
+    // Migration : conserve les choix existants, ajoute les nouveaux sports avec leur default_on
+    for (const s of SPORTS) if (!(s.key in saved)) saved[s.key] = s.default_on;
+    return saved;
+  })(),
+  notified:      ls("arb_notified", {}),
+  history:       ls("arb_history", []),
+  hidden:        ls("arb_hidden", {}),
+  tab:           ls("arb_tab", "scanner"),
+  bankroll:      Number(ls("arb_bankroll", 1000)),
+  bets:          ls("arb_bets", []),
+  valueEdge:     Number(ls("arb_value_edge", 3.0)),
+  kellyFraction: Number(ls("arb_kelly_fr", 0.25)),
+
+  // v3 nouveau
+  adaptiveRefresh:  ls("arb_adaptive", true) === true,        // ON par défaut
+  apiPauseAt:       Number(ls("arb_api_pause", 30)),
+  cacheMs:          Number(ls("arb_cache_ms", 25000)),
+  minConfidence:    Number(ls("arb_min_conf", 0)),            // filtre affichage par confiance
+  notifyConfidence: Number(ls("arb_notify_conf", 6)),         // notif que si conf >= X
+  maxBetPct:        Number(ls("arb_max_bet_pct", 5)),         // mise max % bankroll actuelle
+  dailyLossLimitPct:Number(ls("arb_daily_loss", 10)),         // stop-loss journalier
+  cooldownLosses:   Number(ls("arb_cooldown", 3)),            // pause après N défaites consécutives
+  cooldownMin:      Number(ls("arb_cooldown_min", 60)),       // durée pause (min)
+  mmEnabled:        ls("arb_mm_on", true) === true,           // money management ON par défaut
+  clvEnabled:       ls("arb_clv_on", true) === true,
+  scanWindowMin:    Number(ls("arb_scan_window", 0)),         // ne scanner que jusqu'à X jours (0 = tous)
+  pausedUntil:      Number(ls("arb_paused_until", 0)),
+
+  // runtime
+  data: [],
+  valueBets: [],
+  rawCount: 0,
+  quotaRemaining: null,
+  quotaUsed: null,
+  loading: false,
+  error: null,
+  warning: null,
+  lastUpdate: null,
+  countdown: 0,
+  scanCount: Number(ls("arb_scan_count", 0)),
+  bestArbToday: Number(ls("arb_best_today", 0)),
+  bestArbDate: ls("arb_best_date", ""),
+  flashIds: new Set(),
+  oddsCache: new Map(),
+  scanLock: false,
+  bankrollChart: null,
+  recentEmptyScans: 0,           // pour adaptive refresh
+  nextRefreshSec: 60,            // valeur calculée par adaptive
+  lastRefreshFactor: 1,          // multiplicateur appliqué
+};
+
+let MIN_ARB_PCT = state.minArb;
+let timer = null;
+let countdownTimer = null;
+
+/* ====== API CLIENT ====== */
+async function fetchOddsCached(sportKey, apiKey) {
+  const cached = state.oddsCache.get(sportKey);
+  if (cached && (Date.now() - cached.ts) < state.cacheMs) {
+    return { events: cached.events, fromCache: true };
+  }
+  const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds/` +
+    `?apiKey=${encodeURIComponent(apiKey)}&regions=eu&markets=${MARKETS.join(",")}` +
+    `&bookmakers=${FRENCH_BOOKMAKERS.join(",")}&oddsFormat=decimal`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${sportKey} -> HTTP ${r.status}`);
+  const remaining = r.headers.get("x-requests-remaining");
+  const used = r.headers.get("x-requests-used");
+  if (remaining !== null) state.quotaRemaining = Number(remaining);
+  if (used !== null) state.quotaUsed = Number(used);
+  const events = await r.json();
+  state.oddsCache.set(sportKey, { ts: Date.now(), events });
+  return { events, fromCache: false };
+}
+
+/* ====== ARB + VALUE LOGIC ====== */
+function bestOddsForMarket(bookmakers, marketKey) {
+  const best = {}, books = {}, bookKeys = {}, allOdds = {}, allLines = {};
+  let bookCount = 0;
+  for (const b of bookmakers) {
+    const m = b.markets && b.markets.find(x => x.key === marketKey);
+    if (!m) continue;
+    bookCount++;
+    for (const o of m.outcomes) {
+      const key = o.point !== undefined ? `${o.name} ${o.point}` : o.name;
+      if (o.point !== undefined) (allLines[o.name] = allLines[o.name] || []).push(o.point);
+      if (!best[key] || o.price > best[key]) {
+        best[key] = o.price;
+        books[key] = BOOK_LABELS[b.key] || b.title;
+        bookKeys[key] = b.key;
+      }
+      (allOdds[key] = allOdds[key] || []).push(o.price);
+    }
+  }
+  return { best, books, bookKeys, allOdds, allLines, bookCount };
+}
+
+function computeFairOdds(allOdds) {
+  const outcomes = Object.keys(allOdds);
+  if (outcomes.length < 2) return {};
+  const avg = {};
+  for (const k of outcomes) avg[k] = allOdds[k].reduce((a,b)=>a+b,0) / allOdds[k].length;
+  const margin = outcomes.reduce((s,k)=>s + 1/avg[k], 0);
+  const fair = {};
+  for (const k of outcomes) fair[k] = avg[k] * margin;
+  return fair;
+}
+
+// Variance des lignes O/U entre books — clé pour la confiance
+function lineConsensus(allLines) {
+  const out = {};
+  for (const [name, lines] of Object.entries(allLines)) {
+    if (!lines.length) continue;
+    const min = Math.min(...lines);
+    const max = Math.max(...lines);
+    const avg = lines.reduce((a,b)=>a+b,0) / lines.length;
+    out[name] = { min, max, avg: r2(avg), variance: r2(max - min), count: lines.length };
+  }
+  return out;
+}
+
+/**
+ * Score de confiance 1-10 par opportunité.
+ * Combine 4 signaux objectifs : couverture books, variance ligne O/U,
+ * temps avant match, magnitude de l'edge (trop fort = suspect).
+ */
+function computeConfidence(opp) {
+  let score = 5;
+
+  // Couverture books (4/4 = très fiable)
+  if (opp.book_count === 4)      score += 2;
+  else if (opp.book_count === 3) score += 1;
+  else                            score -= 1;
+
+  // Variance ligne O/U (uniquement pour totals)
+  if (opp.market === "totals") {
+    const variances = Object.values(opp.line_consensus || {}).map(c => c.variance);
+    const maxVar = variances.length ? Math.max(...variances) : 0;
+    if (maxVar === 0)      score += 2;     // toutes les lignes identiques
+    else if (maxVar <= 0.5) score += 1;
+    else if (maxVar <= 1.5) score += 0;
+    else if (maxVar <= 3)   score -= 1;
+    else                    score -= 3;     // > 3 pts d'écart : très suspect
+  }
+
+  // Temps avant kickoff
+  const hoursToStart = (new Date(opp.start_time) - Date.now()) / 3600000;
+  if (hoursToStart > 24)      score += 1;
+  else if (hoursToStart > 6)  score += 0;
+  else if (hoursToStart > 1)  score -= 1;
+  else if (hoursToStart > 0)  score -= 2;
+  else                         score -= 3;   // déjà commencé
+
+  // Magnitude de l'edge (trop = bug ou cote stale)
+  if (opp.arb_pct > 10)      score -= 4;
+  else if (opp.arb_pct > 6)  score -= 2;
+  else if (opp.arb_pct > 3)  score += 1;
+
+  return Math.max(1, Math.min(10, Math.round(score)));
+}
+
+function processEvent(ev, sport) {
+  const fb = ev.bookmakers.filter(b => FRENCH_BOOKMAKERS.includes(b.key));
+  if (fb.length < 2) return [];
+  const results = [];
+  for (const market of MARKETS) {
+    const { best, books, bookKeys, allOdds, allLines, bookCount } = bestOddsForMarket(fb, market);
+    if (Object.keys(best).length < 2) continue;
+    const sum = Object.values(best).reduce((a,o)=>a+1/o, 0);
+    const arb = (1 - sum) * 100;
+    const fair = computeFairOdds(allOdds);
+    const lineCons = lineConsensus(allLines);
+    const liq = bookCount / FRENCH_BOOKMAKERS.length;
+    const oddsR = {}; for (const [k,v] of Object.entries(best)) oddsR[k] = r2(v);
+    const fairR = {}; for (const [k,v] of Object.entries(fair)) fairR[k] = r2(v);
+    const edges = {};
+    for (const k of Object.keys(best)) if (fair[k]) edges[k] = r2((best[k]/fair[k] - 1) * 100);
+    const maxEdge = Object.values(edges).length ? Math.max(...Object.values(edges)) : 0;
+    const score = arb*0.6 + sport.priority*2.5 + liq*1.5;
+
+    const opp = {
+      id: `${ev.id || (ev.home_team+ev.away_team)}|${market}|${ev.commence_time}`,
+      raw_event_id: ev.id,
+      event: `${ev.home_team} vs ${ev.away_team}`,
+      sport: sport.label, sport_key: sport.key, sport_emoji: sport.emoji,
+      sport_research: sport.research,
+      market, market_label: market === "h2h" ? "1N2 / Vainqueur" : "Total points (O/U)",
+      start_time: ev.commence_time,
+      best_odds: oddsR, fair_odds: fairR, edges,
+      max_edge: r2(maxEdge),
+      books, book_keys: bookKeys,
+      arb_pct: r2(arb),
+      value_score: r2(score),
+      book_count: bookCount,
+      line_consensus: lineCons,
+      home_team: ev.home_team, away_team: ev.away_team,
+    };
+    opp.confidence = computeConfidence(opp);
+    results.push(opp);
+  }
+  return results;
+}
+
+async function getTopOpportunities(apiKey) {
+  // Pause manuelle (cooldown money management)
+  if (state.pausedUntil > Date.now()) {
+    const minLeft = Math.ceil((state.pausedUntil - Date.now()) / 60000);
+    state.warning = `⏸ Cooldown actif (${minLeft} min restantes). Reprends ton souffle, le marché ne va nulle part.`;
+    return { arbs: [], values: [] };
+  }
+  // Pause auto si quota bas
+  if (state.quotaRemaining !== null && state.quotaRemaining < state.apiPauseAt) {
+    state.warning = `⏸ Quota API bas (${state.quotaRemaining} restants < seuil ${state.apiPauseAt}). Scan en pause auto.`;
+    return { arbs: [], values: [] };
+  }
+  state.warning = null;
+  const enabled = SPORTS.filter(s => state.enabledSports[s.key]);
+  if (!enabled.length) return { arbs: [], values: [] };
+  const res = await Promise.allSettled(
+    enabled.map(s => fetchOddsCached(s.key, apiKey).then(r => ({ sport: s, ...r })))
+  );
+  const arbs = [], values = [];
+  let totalEvents = 0; const errors = [];
+  for (const r of res) {
+    if (r.status !== "fulfilled") { errors.push(r.reason?.message || "err"); continue; }
+    totalEvents += (r.value.events || []).length;
+    for (const ev of (r.value.events || [])) {
+      // Filtre fenêtre temporelle
+      if (state.scanWindowMin > 0) {
+        const minToStart = (new Date(ev.commence_time) - Date.now()) / 60000;
+        if (minToStart > state.scanWindowMin) continue;
+      }
+      const opps = processEvent(ev, r.value.sport);
+      for (const o of opps) {
+        if (state.hidden[o.id]) continue;
+        if (o.confidence < state.minConfidence) continue;
+        if (o.arb_pct >= MIN_ARB_PCT) arbs.push(o);
+        if (o.max_edge >= state.valueEdge) values.push(o);
+      }
+    }
+  }
+  state.rawCount = totalEvents;
+  // Filtrage des erreurs "hors-saison" (HTTP 422) qui ne sont pas vraiment des erreurs
+  const realErrors = errors.filter(e => !/422|UNKNOWN_SPORT|Sport not found/i.test(e));
+  if (realErrors.length === enabled.length) throw new Error("Toutes les requêtes ont échoué : " + realErrors[0]);
+  if (realErrors.length > 0 && realErrors.length < enabled.length) {
+    state.warning = `${realErrors.length} sport(s) en erreur, ${enabled.length - realErrors.length} OK. Les sports hors-saison sont ignorés silencieusement.`;
+  }
+
+  const sortFn = {
+    confidence: (a,b)=>b.confidence-a.confidence || b.value_score-a.value_score,
+    value_score:(a,b)=>b.value_score-a.value_score,
+    arb_pct:    (a,b)=>b.arb_pct-a.arb_pct,
+    start_time: (a,b)=>new Date(a.start_time)-new Date(b.start_time),
+    sport:      (a,b)=>a.sport.localeCompare(b.sport) || b.value_score-a.value_score,
+    edge:       (a,b)=>b.max_edge-a.max_edge,
+  }[state.sortBy] || ((a,b)=>b.confidence-a.confidence);
+
+  return {
+    arbs: arbs.sort(sortFn).slice(0, TOP_N),
+    values: values.sort((a,b)=>b.confidence-a.confidence || b.max_edge - a.max_edge).slice(0, TOP_N),
+  };
+}
+
+function calculateStakes(odds, total=100) {
+  const sum = Object.values(odds).reduce((a,o)=>a+1/o, 0);
+  const stakes = {};
+  for (const [k,v] of Object.entries(odds)) stakes[k] = r2((total/v)/sum * 100);
+  const f = Object.keys(odds)[0];
+  const profit = r2(stakes[f] * odds[f] - total);
+  const roi = r2(profit/total * 100);
+  return { stakes, profit, roi };
+}
+
+function kellyStake(odds, fairOdds, bankroll, fraction=0.25) {
+  if (!fairOdds || fairOdds <= 1) return 0;
+  const b = odds - 1;
+  const p = 1 / fairOdds;
+  const q = 1 - p;
+  const fStar = (b*p - q) / b;
+  if (fStar <= 0) return 0;
+  return r2(bankroll * fStar * fraction);
+}
+
+/* ====== ADAPTIVE SCHEDULER ======
+   Calcule la prochaine fréquence de scan en fonction de :
+   - Quota API restant (× 1.5 à × 4 si bas)
+   - Heure de la journée (× 3 la nuit)
+   - Activité récente (× 2 si rien trouvé depuis 3 scans)
+   - Onglet visible/caché (× 4 si caché)
+*/
+function computeAdaptiveDelay() {
+  if (!state.adaptiveRefresh) return state.refreshSec;
+  const base = state.refreshSec;
+  let factor = 1;
+  const reasons = [];
+
+  if (state.quotaRemaining !== null) {
+    if (state.quotaRemaining < 50)       { factor *= 4;   reasons.push("quota<50 ×4"); }
+    else if (state.quotaRemaining < 100) { factor *= 2.5; reasons.push("quota<100 ×2.5"); }
+    else if (state.quotaRemaining < 200) { factor *= 1.5; reasons.push("quota<200 ×1.5"); }
+  }
+
+  const h = new Date().getHours();
+  if (h >= 2 && h < 7)        { factor *= 3;   reasons.push("nuit ×3"); }
+  else if (h >= 7 && h < 11)  { factor *= 1.5; reasons.push("matin ×1.5"); }
+
+  if (state.recentEmptyScans >= 3)      { factor *= 2;   reasons.push("inactif ×2"); }
+  else if (state.recentEmptyScans >= 5) { factor *= 3;   reasons.push("très inactif ×3"); }
+
+  if (typeof document !== "undefined" && document.hidden) { factor *= 4; reasons.push("onglet caché ×4"); }
+
+  state.lastRefreshFactor = factor;
+  state.adaptiveReasons = reasons;
+  return Math.round(base * factor);
+}
+
+/* ====== MONEY MANAGEMENT ======
+   Vérifie qu'un pari respecte les règles :
+   - Mise ≤ X% de la bankroll actuelle
+   - Pas dépassé le stop-loss journalier
+   - Pas en cooldown post-défaites consécutives
+*/
+function checkMoneyManagement(stake) {
+  if (!state.mmEnabled) return { ok: true };
+
+  const stats = computeStats();
+  const cur = stats.currentBankroll;
+  if (cur <= 0) return { ok: false, reason: "Bankroll épuisée. Reset ou stop." };
+
+  // Mise max
+  const maxBet = cur * (state.maxBetPct / 100);
+  if (stake > maxBet) {
+    return { ok: false, reason: `Mise (${stake}€) > ${state.maxBetPct}% de la bankroll actuelle (${maxBet.toFixed(0)}€). Réduis ou désactive le money management.` };
+  }
+
+  // Stop-loss journalier
+  const today = todayISO();
+  const todayLosses = state.bets
+    .filter(b => b.settledAt && b.settledAt.slice(0,10) === today && b.status === "lost")
+    .reduce((s,b) => s + b.stake, 0);
+  const dailyLimit = cur * (state.dailyLossLimitPct / 100);
+  if (todayLosses >= dailyLimit) {
+    return { ok: false, reason: `Stop-loss journalier atteint (${todayLosses.toFixed(0)}€ perdus / limite ${dailyLimit.toFixed(0)}€). Reviens demain.` };
+  }
+
+  // Cooldown défaites consécutives
+  const recentSettled = [...state.bets]
+    .filter(b => b.status === "won" || b.status === "lost")
+    .sort((a,b) => new Date(b.settledAt||b.date) - new Date(a.settledAt||a.date));
+  let consecLosses = 0;
+  for (const b of recentSettled) {
+    if (b.status === "lost") consecLosses++;
+    else break;
+  }
+  if (consecLosses >= state.cooldownLosses) {
+    const cooldownEnd = state.pausedUntil || (Date.now() + state.cooldownMin*60000);
+    state.pausedUntil = cooldownEnd;
+    save("arb_paused_until", cooldownEnd);
+    const minLeft = Math.ceil((cooldownEnd - Date.now()) / 60000);
+    return { ok: false, reason: `${consecLosses} défaites consécutives. Cooldown ${minLeft} min activé. Pause forcée pour éviter le tilt.` };
+  }
+
+  return { ok: true };
+}
+
+/* ====== BET TRACKER ====== */
+function addBet(bet, opportunity = null) {
+  const stake = Number(bet.stake) || 0;
+  const mm = checkMoneyManagement(stake);
+  if (!mm.ok) {
+    alert("⛔ Money management : " + mm.reason);
+    return null;
+  }
+  const b = {
+    id: uid(),
+    date: bet.date || new Date().toISOString(),
+    sport: bet.sport || "?",
+    event: bet.event || "?",
+    market: bet.market || "h2h",
+    selection: bet.selection || "?",
+    book: bet.book || "?",
+    odds_at_bet: Number(bet.odds) || 0,
+    odds: Number(bet.odds) || 0,
+    stake,
+    status: "pending",
+    type: bet.type || "manual",
+    note: bet.note || "",
+    confidence: opportunity?.confidence || null,
+    opportunity_id: opportunity?.id || null,
+    closing_odds: null,
+    clv_pct: null,
+  };
+  state.bets.unshift(b);
+  save("arb_bets", state.bets);
+  return b;
+}
+
+function settleBet(id, status) {
+  const b = state.bets.find(x => x.id === id);
+  if (!b) return;
+  b.status = status;
+  b.settledAt = new Date().toISOString();
+  if (status === "won")  b.payout = r2(b.stake * b.odds);
+  if (status === "lost") b.payout = 0;
+  if (status === "push" || status === "void") b.payout = b.stake;
+  save("arb_bets", state.bets);
+}
+
+function deleteBet(id) {
+  state.bets = state.bets.filter(b => b.id !== id);
+  save("arb_bets", state.bets);
+}
+
+function profitOf(bet) {
+  if (bet.status === "pending") return 0;
+  if (bet.status === "won")     return r2(bet.stake * (bet.odds - 1));
+  if (bet.status === "lost")    return -bet.stake;
+  return 0;
+}
+
+/* ====== CLV TRACKER ======
+   Capture la cote de fermeture pour les paris en attente dont le match
+   commence dans < 30 min. Mesure ton skill réel à long terme.
+*/
+async function captureClosingOdds() {
+  if (!state.clvEnabled || !state.apiKey) return;
+  const now = Date.now();
+  const candidates = state.bets.filter(b =>
+    b.status === "pending" &&
+    !b.closing_odds &&
+    b.opportunity_id &&
+    new Date(b.event_start || b.date).getTime() - now < 30*60*1000 &&
+    new Date(b.event_start || b.date).getTime() - now > 0
+  );
+  if (!candidates.length) return;
+
+  // Group by sport_key pour minimiser les appels
+  const bySport = {};
+  for (const b of candidates) {
+    const sportKey = b.sport_key || guessSportKey(b.sport);
+    if (!sportKey) continue;
+    (bySport[sportKey] = bySport[sportKey] || []).push(b);
+  }
+
+  for (const [sportKey, bets] of Object.entries(bySport)) {
+    try {
+      const { events } = await fetchOddsCached(sportKey, state.apiKey);
+      for (const bet of bets) {
+        const ev = events.find(e =>
+          (e.id && bet.opportunity_id?.includes(e.id)) ||
+          `${e.home_team} vs ${e.away_team}` === bet.event
+        );
+        if (!ev) continue;
+        const closing = findClosingOddsFor(ev, bet);
+        if (closing) {
+          bet.closing_odds = closing;
+          bet.clv_pct = r2((bet.odds_at_bet / closing - 1) * 100);
+          bet.closing_captured_at = new Date().toISOString();
+        }
+      }
+    } catch (e) { console.warn("[CLV]", e.message); }
+  }
+  save("arb_bets", state.bets);
+}
+
+function findClosingOddsFor(ev, bet) {
+  // Cherche la meilleure cote actuelle pour la même sélection
+  const fb = ev.bookmakers.filter(b => FRENCH_BOOKMAKERS.includes(b.key));
+  let best = 0;
+  for (const b of fb) {
+    const m = b.markets?.find(x => x.key === bet.market);
+    if (!m) continue;
+    for (const o of m.outcomes) {
+      const key = o.point !== undefined ? `${o.name} ${o.point}` : o.name;
+      if (key === bet.selection && o.price > best) best = o.price;
+    }
+  }
+  return best || null;
+}
+
+function guessSportKey(label) {
+  const s = SPORTS.find(s => s.label === label);
+  return s?.key || null;
+}
+
+/* ====== STATS ENGINE ====== */
+function computeStats() {
+  const bets = state.bets;
+  const settled = bets.filter(b => b.status !== "pending");
+  const won = settled.filter(b => b.status === "won").length;
+  const lost = settled.filter(b => b.status === "lost").length;
+  const totalStake = settled.reduce((s,b)=>s+b.stake, 0);
+  const totalProfit = settled.reduce((s,b)=>s+profitOf(b), 0);
+  const winRate = settled.length ? won / settled.length * 100 : 0;
+  const yieldPct = totalStake ? totalProfit / totalStake * 100 : 0;
+  const roi = state.bankroll ? totalProfit / state.bankroll * 100 : 0;
+  const currentBankroll = state.bankroll + totalProfit;
+
+  // Bankroll cumulée
+  const sortedSettled = [...settled].sort((a,b)=>new Date(a.settledAt) - new Date(b.settledAt));
+  let bk = state.bankroll;
+  const bankrollSeries = [{ x: null, y: bk }];
+  for (const b of sortedSettled) {
+    bk += profitOf(b);
+    bankrollSeries.push({ x: b.settledAt, y: r2(bk) });
+  }
+
+  // Streak
+  let curStreak = 0, curType = null, longestWin = 0, longestLoss = 0;
+  for (const b of sortedSettled) {
+    if (b.status === "push" || b.status === "void") continue;
+    if (b.status === curType) curStreak++;
+    else { curStreak = 1; curType = b.status; }
+    if (curType === "won"  && curStreak > longestWin)  longestWin = curStreak;
+    if (curType === "lost" && curStreak > longestLoss) longestLoss = curStreak;
+  }
+
+  // CLV moyen (paris avec cote de fermeture capturée)
+  const withClv = settled.filter(b => b.clv_pct !== null && b.clv_pct !== undefined);
+  const avgClv = withClv.length ? withClv.reduce((s,b)=>s+b.clv_pct, 0) / withClv.length : null;
+  const positiveClvRate = withClv.length ? withClv.filter(b => b.clv_pct > 0).length / withClv.length * 100 : null;
+
+  // Today P&L
+  const today = todayISO();
+  const todaySettled = settled.filter(b => b.settledAt && b.settledAt.slice(0,10) === today);
+  const todayProfit = todaySettled.reduce((s,b) => s + profitOf(b), 0);
+  const todayLosses = settled.filter(b => b.settledAt && b.settledAt.slice(0,10) === today && b.status === "lost").reduce((s,b)=>s+b.stake, 0);
+
+  // Par sport / book / bucket
+  const aggregator = (keyFn) => {
+    const out = {};
+    for (const b of settled) {
+      const k = keyFn(b);
+      out[k] = out[k] || { count:0, won:0, stake:0, profit:0 };
+      out[k].count++;
+      if (b.status === "won") out[k].won++;
+      out[k].stake += b.stake;
+      out[k].profit += profitOf(b);
+    }
+    for (const k of Object.keys(out)) {
+      out[k].winRate = out[k].count ? out[k].won / out[k].count * 100 : 0;
+      out[k].yield   = out[k].stake ? out[k].profit / out[k].stake * 100 : 0;
+    }
+    return out;
+  };
+  const bySport = aggregator(b => b.sport);
+  const byBook  = aggregator(b => b.book);
+  const byBucket = ODD_BUCKETS.map(b => ({ ...b, count:0, won:0, stake:0, profit:0 }));
+  for (const b of settled) {
+    const bucket = byBucket.find(bu => b.odds > bu.min && b.odds <= bu.max);
+    if (!bucket) continue;
+    bucket.count++;
+    if (b.status === "won") bucket.won++;
+    bucket.stake += b.stake;
+    bucket.profit += profitOf(b);
+  }
+  for (const b of byBucket) {
+    b.winRate = b.count ? b.won / b.count * 100 : 0;
+    b.yield   = b.stake ? b.profit / b.stake * 100 : 0;
+  }
+
+  return {
+    nb: bets.length, nbPending: bets.length-settled.length, nbSettled: settled.length,
+    won, lost, winRate: r2(winRate), yieldPct: r2(yieldPct), roi: r2(roi),
+    totalStake: r2(totalStake), totalProfit: r2(totalProfit),
+    currentBankroll: r2(currentBankroll), bankrollSeries,
+    longestWin, longestLoss, currentStreak: { count: curStreak, type: curType },
+    avgClv: avgClv !== null ? r2(avgClv) : null,
+    positiveClvRate: positiveClvRate !== null ? r2(positiveClvRate) : null,
+    nbWithClv: withClv.length,
+    todayProfit: r2(todayProfit), todayLosses: r2(todayLosses), todayCount: todaySettled.length,
+    bySport, byBook, byBucket,
+  };
+}
+
+/* ====== ALERTES ====== */
+async function sendNtfy(opp) {
+  try {
+    const oddsTxt = Object.entries(opp.best_odds)
+      .map(([k,v]) => `${k}: ${v} (${opp.books[k]})`).join("\n");
+    await fetch("https://ntfy.sh", {
+      method: "POST",
+      body: JSON.stringify({
+        topic: state.ntfyTopic,
+        title: `${opp.sport_emoji} +${opp.arb_pct}% — ${opp.sport} (conf ${opp.confidence}/10)`,
+        message: `${opp.event}\n${opp.market_label}\n\n${oddsTxt}\n\nDébut : ${new Date(opp.start_time).toLocaleString("fr-FR")}`,
+        priority: opp.arb_pct >= state.urgentArb ? 5 : 4,
+        tags: opp.arb_pct >= state.urgentArb ? ["rotating_light","moneybag","fire"] : ["moneybag","chart_with_upwards_trend"],
+      }),
+    });
+  } catch(e) { console.error("[ntfy]", e); }
+}
+
+let audioCtx = null;
+function playBeep() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const beep = (freq, when, dur=0.2) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.25, audioCtx.currentTime + when);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + when + dur);
+      osc.start(audioCtx.currentTime + when);
+      osc.stop(audioCtx.currentTime + when + dur);
+    };
+    beep(880, 0); beep(1320, 0.18); beep(1760, 0.36);
+  } catch(e) {}
+}
+
+function desktopNotify(opp) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  new Notification(`${opp.sport_emoji} Arb +${opp.arb_pct}% — ${opp.sport}`, {
+    body: `${opp.event}\nConf ${opp.confidence}/10 · Début : ${new Date(opp.start_time).toLocaleString("fr-FR")}`,
+    tag: opp.id,
+  });
+}
+
+function checkAlerts(opps) {
+  const fresh = [];
+  for (const opp of opps) {
+    const lastArb = state.notified[opp.id] ?? -999;
+    if (opp.arb_pct > lastArb + 0.3) {
+      // v3 : notif uniquement si confiance suffisante
+      if (opp.arb_pct >= state.notifyArb && opp.confidence >= state.notifyConfidence) {
+        if (state.alertsEnabled && state.ntfyTopic) sendNtfy(opp);
+        if (state.soundEnabled) playBeep();
+        if (state.desktopNotif) desktopNotify(opp);
+      }
+      state.history.unshift({ ...opp, detected_at: Date.now() });
+      state.notified[opp.id] = opp.arb_pct;
+      fresh.push(opp.id);
+      const today = todayISO();
+      if (state.bestArbDate !== today) { state.bestArbDate = today; state.bestArbToday = 0; }
+      if (opp.arb_pct > state.bestArbToday) state.bestArbToday = opp.arb_pct;
+    }
+  }
+  state.history = state.history.slice(0, 200);
+  state.flashIds = new Set(fresh);
+  // Cleanup robuste
+  const cutoff = Date.now() - 7*24*3600*1000;
+  for (const id of Object.keys(state.notified)) {
+    const parts = id.split("|");
+    const isoCandidate = parts[parts.length-1];
+    const ts = Date.parse(isoCandidate);
+    if (Number.isFinite(ts) && ts < cutoff) delete state.notified[id];
+  }
+  save("arb_notified", state.notified);
+  save("arb_history", state.history);
+  save("arb_best_today", state.bestArbToday);
+  save("arb_best_date", state.bestArbDate);
+}
+
+/* ====== EXPORTS ====== */
+function exportCSV() {
+  if (!state.history.length) { alert("Aucun historique."); return; }
+  const headers = ["detected_at","event","sport","market","start_time","arb_pct","max_edge","confidence","value_score","best_odds","books"];
+  const rows = state.history.map(h => [
+    new Date(h.detected_at).toISOString(),
+    h.event, h.sport, h.market||"h2h", h.start_time, h.arb_pct, h.max_edge||"", h.confidence||"", h.value_score,
+    JSON.stringify(h.best_odds), JSON.stringify(h.books),
+  ]);
+  downloadFile([headers.join(","), ...rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(","))].join("\n"),
+    `arbitrage-history-${todayISO()}.csv`, "text/csv");
+}
+
+function exportBetsCSV() {
+  if (!state.bets.length) { alert("Aucun pari."); return; }
+  const headers = ["date","status","sport","event","market","selection","book","odds_at_bet","closing_odds","clv_pct","stake","payout","profit","confidence","type","note"];
+  const rows = state.bets.map(b => [
+    b.date, b.status, b.sport, b.event, b.market, b.selection, b.book,
+    b.odds_at_bet||b.odds, b.closing_odds||"", b.clv_pct??"", b.stake, b.payout??"", profitOf(b), b.confidence||"", b.type, b.note,
+  ]);
+  downloadFile([headers.join(","), ...rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(","))].join("\n"),
+    `bets-${todayISO()}.csv`, "text/csv");
+}
+
+function exportJSON() {
+  const snap = {
+    exported_at: new Date().toISOString(),
+    bankroll: state.bankroll, bets: state.bets, history: state.history,
+    snapshot: state.data, valueBets: state.valueBets,
+  };
+  downloadFile(JSON.stringify(snap, null, 2), `arbitrage-full-${Date.now()}.json`, "application/json");
+}
+
+function downloadFile(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ====== UI ROOT ====== */
+function render() {
+  const app = document.getElementById("app");
+  const enabledCount = Object.values(state.enabledSports).filter(Boolean).length;
+  app.innerHTML = `
+    <div class="max-w-7xl mx-auto">
+      ${renderHeader()}
+      ${renderTabs()}
+      ${state.tab === "scanner" ? renderScannerTab(enabledCount) : ""}
+      ${state.tab === "tracker" ? renderTrackerTab() : ""}
+      ${state.tab === "stats"   ? renderStatsTab()   : ""}
+      ${state.tab === "settings"? renderSettingsTab(): ""}
+      <footer class="mt-8 text-center text-xs text-slate-600">
+        v3 · Données : The Odds API · ⚠ Pariez avec modération · joueurs-info-service.fr · 09 74 75 13 13
+      </footer>
+    </div>
+  `;
+  attachListeners();
+  if (state.tab === "stats") renderBankrollChart();
+}
+
+function renderHeader() {
+  const adaptiveBadge = state.adaptiveRefresh && state.lastRefreshFactor > 1
+    ? `<span title="Refresh adaptatif actif" class="text-amber-400">×${state.lastRefreshFactor.toFixed(1)}</span>` : "";
+  return `
+    <header class="mb-4 flex items-start justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-3xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 text-transparent bg-clip-text">
+          Arbitrage Sportif FR <span class="text-xs text-slate-500 font-normal">v3</span>
+        </h1>
+        <p class="text-slate-400 text-sm mt-1">Smart scan · CLV tracking · Money management</p>
+      </div>
+      <div class="flex items-center gap-3 text-xs text-slate-400 flex-wrap">
+        ${state.lastUpdate ? `
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 pulse-dot"></span>
+            <span>Maj ${state.lastUpdate.toLocaleTimeString("fr-FR")}</span>
+          </div>
+          <span>·</span>
+          <span>Prochain : <span id="countdown" class="font-mono text-emerald-400">${state.countdown}s</span> ${adaptiveBadge}</span>
+        ` : `<span class="text-slate-500">en attente…</span>`}
+        ${state.quotaRemaining !== null ? `
+          <span>·</span>
+          <span title="Quota API restant ce mois">Quota : <strong class="${state.quotaRemaining<state.apiPauseAt?'text-red-400':'text-slate-200'}">${state.quotaRemaining}</strong></span>
+        ` : ""}
+        ${state.pausedUntil > Date.now() ? `<span class="text-amber-400">⏸ pause ${Math.ceil((state.pausedUntil-Date.now())/60000)}min</span>` : ""}
+      </div>
+    </header>
+  `;
+}
+
+function renderTabs() {
+  const tab = (key, label) => `
+    <button data-tab="${key}" class="tab-btn px-3 md:px-4 py-2 border-b-2 font-medium text-xs md:text-sm ${state.tab===key?'tab-active':'tab-inactive'}">
+      ${label}
+    </button>`;
+  return `
+    <nav class="flex border-b border-slate-800 mb-4 gap-1 overflow-x-auto">
+      ${tab("scanner","🔍 Scanner")}
+      ${tab("tracker","📊 Tracker")}
+      ${tab("stats","📈 Stats")}
+      ${tab("settings","⚙️ Réglages")}
+    </nav>
+  `;
+}
+
+/* ====== SCANNER TAB ====== */
+function renderScannerTab(enabledCount) {
+  return `
+    <!-- BARRE PRINCIPALE -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+        <div class="md:col-span-3">
+          <label class="block text-xs text-slate-400 mb-1">Clé The Odds API</label>
+          <input id="apiKey" type="password" placeholder="abc123..." value="${escapeAttr(state.apiKey)}"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-xs text-slate-400 mb-1">Mise (€)</label>
+          <input id="stake" type="number" min="1" value="${state.stake}"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-xs text-slate-400 mb-1">Affiche arb ≥ %</label>
+          <input id="minArb" type="number" step="0.1" min="-50" value="${state.minArb}"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-xs text-slate-400 mb-1">Conf min</label>
+          <input id="minConfidence" type="number" min="0" max="10" value="${state.minConfidence}"
+            class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+        </div>
+        <div class="md:col-span-3">
+          <label class="block text-xs text-slate-400 mb-1">Trier par</label>
+          <select id="sortBy" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+            <option value="confidence" ${state.sortBy==="confidence"?"selected":""}>🎯 Confiance</option>
+            <option value="value_score" ${state.sortBy==="value_score"?"selected":""}>Score valeur</option>
+            <option value="arb_pct" ${state.sortBy==="arb_pct"?"selected":""}>Arb %</option>
+            <option value="edge" ${state.sortBy==="edge"?"selected":""}>Edge value</option>
+            <option value="start_time" ${state.sortBy==="start_time"?"selected":""}>Début</option>
+            <option value="sport" ${state.sortBy==="sport"?"selected":""}>Sport</option>
+          </select>
+        </div>
+      </div>
+      <div class="mt-3 flex gap-2 flex-wrap items-center">
+        <button id="refresh" ${state.loading||!state.apiKey?"disabled":""}
+          class="bg-emerald-500 hover:bg-emerald-600 disabled:opacity-40 text-slate-950 font-semibold px-4 py-2 rounded text-sm">
+          ${state.loading?"⟳ Scan…":"⚡ Scanner maintenant"}
+        </button>
+        <button id="exportJson" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded text-sm ml-auto" ${!state.data.length?"disabled":""}>⤓ JSON</button>
+        <button id="exportCsv" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded text-sm" ${!state.history.length?"disabled":""}>⤓ CSV</button>
+      </div>
+    </section>
+
+    <!-- SPORTS — groupés par catégorie, sports désactivés repliables -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h2 class="text-sm font-semibold text-slate-300">
+          Sports (${enabledCount}/${SPORTS.length})
+          <span class="text-xs text-slate-500 font-normal">· chaque sport activé = +1 req/scan</span>
+        </h2>
+        <div class="flex gap-2 text-xs flex-wrap">
+          <button id="sportsAll"  class="text-emerald-400 hover:underline" title="Tout activer (attention quota)">tout (${SPORTS.length})</button>
+          <button id="sportsNone" class="text-slate-400 hover:underline">aucun</button>
+          <button id="sportsKey"  class="text-cyan-400 hover:underline" title="NBA + 7 ligues foot top">NBA + foot top</button>
+          <button id="sportsEss"  class="text-amber-400 hover:underline" title="Le minimum syndical pour le free tier">éco quota (NBA+L1)</button>
+        </div>
+      </div>
+      ${SPORT_CATEGORIES.map(cat => {
+        const sportsInCat = SPORTS.filter(s => s.cat === cat);
+        if (!sportsInCat.length) return "";
+        const enabledInCat = sportsInCat.filter(s => state.enabledSports[s.key]).length;
+        return `
+          <details class="mb-2 border border-slate-800 rounded" ${enabledInCat>0?"open":""}>
+            <summary class="px-3 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800 flex justify-between items-center">
+              <span>${escapeHtml(cat)} <span class="text-slate-500">(${enabledInCat}/${sportsInCat.length})</span></span>
+              <span class="flex gap-2 text-[10px]">
+                <button class="cat-all  text-emerald-400 hover:underline" data-cat="${escapeAttr(cat)}">tout</button>
+                <button class="cat-none text-slate-400 hover:underline"  data-cat="${escapeAttr(cat)}">aucun</button>
+              </span>
+            </summary>
+            <div class="flex flex-wrap gap-2 p-3 pt-0">
+              ${sportsInCat.map(s => `
+                <label class="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded text-xs cursor-pointer ${state.enabledSports[s.key]?"ring-1 ring-emerald-500/50":""}">
+                  <input type="checkbox" data-sport="${s.key}" ${state.enabledSports[s.key]?"checked":""} class="sport-toggle" />
+                  <span>${s.emoji} ${escapeHtml(s.label)}</span>
+                </label>
+              `).join("")}
+            </div>
+          </details>
+        `;
+      }).join("")}
+    </section>
+
+    <!-- KPIs -->
+    ${state.lastUpdate ? `
+    <section class="grid grid-cols-3 md:grid-cols-6 gap-3 mb-4">
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Évts</div>
+        <div class="text-2xl font-bold">${state.rawCount}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Arbs</div>
+        <div class="text-2xl font-bold text-emerald-400">${state.data.length}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Values</div>
+        <div class="text-2xl font-bold text-cyan-400">${state.valueBets.length}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Best jour</div>
+        <div class="text-2xl font-bold ${state.bestArbToday>=2?'text-emerald-400':'text-slate-300'}">+${state.bestArbToday}%</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Histo</div>
+        <div class="text-2xl font-bold">${state.history.length}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Quota</div>
+        <div class="text-2xl font-bold ${state.quotaRemaining<state.apiPauseAt?'text-red-400':'text-slate-200'}">${state.quotaRemaining ?? "?"}</div>
+      </div>
+    </section>` : ""}
+
+    ${state.warning ? `<div class="bg-amber-950 border border-amber-800 text-amber-300 rounded p-3 mb-4 text-sm">⚠ ${escapeHtml(state.warning)}</div>`:""}
+    ${state.error ? `<div class="bg-red-950 border border-red-800 text-red-300 rounded p-3 mb-4 text-sm">⚠ ${escapeHtml(state.error)}</div>`:""}
+
+    <!-- ARBITRAGES -->
+    <h3 class="text-sm font-semibold text-slate-300 mb-2 flex items-center gap-2">
+      <span>🎯 Arbitrages purs</span>
+      <span class="text-xs text-slate-500">(profit garanti si tu prends toutes les jambes)</span>
+    </h3>
+    <section class="grid gap-3 mb-6">
+      ${state.data.length===0 && !state.loading ? `
+        <div class="bg-slate-900 rounded-lg p-6 text-center text-slate-500 text-sm">
+          ${state.apiKey
+            ? "Aucun arbitrage ≥ ton seuil avec confiance ≥ "+state.minConfidence+". Voir les value bets ou baisse les seuils."
+            : "👋 Entre ta clé The Odds API pour démarrer."}
+        </div>` : ""
+      }
+      ${state.data.map(opp => renderCard(opp,"arb")).join("")}
+    </section>
+
+    ${state.valueBets.length>0 ? `
+      <h3 class="text-sm font-semibold text-slate-300 mb-2 flex items-center gap-2">
+        <span>💎 Value bets</span>
+        <span class="text-xs text-slate-500">(cote &gt; fair odd, edge ≥ ${state.valueEdge}%, mise Kelly fractionnée 1/4)</span>
+      </h3>
+      <section class="grid gap-3 mb-6">
+        ${state.valueBets.map(opp => renderCard(opp,"value")).join("")}
+      </section>
+    ` : ""}
+
+    ${state.history.length>0 ? `
+    <details class="bg-slate-900 rounded-lg p-4 mb-4">
+      <summary class="flex items-center justify-between text-sm">
+        <span class="text-slate-300 font-semibold">📜 Historique opportunités (${state.history.length})</span>
+        <span class="text-xs text-slate-500">cliquer pour ouvrir</span>
+      </summary>
+      <div class="mt-3 max-h-80 overflow-auto scrollbar">
+        <table class="w-full text-xs">
+          <thead class="text-slate-400 text-left sticky top-0 bg-slate-900">
+            <tr><th class="py-1">Détecté</th><th>Sport</th><th>Match</th><th>Marché</th><th>Conf</th><th>Arb%</th></tr>
+          </thead>
+          <tbody>
+            ${state.history.slice(0,50).map(h => `
+              <tr class="border-t border-slate-800">
+                <td class="py-1.5 text-slate-500">${new Date(h.detected_at).toLocaleString("fr-FR",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</td>
+                <td>${h.sport_emoji||""} ${escapeHtml(h.sport)}</td>
+                <td>${escapeHtml(h.event)}</td>
+                <td class="text-slate-400">${escapeHtml(h.market||"h2h")}</td>
+                <td>${h.confidence||"-"}/10</td>
+                <td class="text-emerald-400 font-semibold">+${h.arb_pct}%</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+      <button id="clearHistory" class="mt-2 text-xs text-slate-500 hover:text-red-400">Effacer tout l'historique</button>
+    </details>` : ""}
+  `;
+}
+
+function renderCard(opp, kind) {
+  const {stakes, profit, roi} = calculateStakes(opp.best_odds, state.stake);
+  const isFresh = state.flashIds.has(opp.id);
+  const arbColor = opp.arb_pct >= 5 ? "text-emerald-300" : opp.arb_pct >= 2 ? "text-emerald-400" : "text-amber-400";
+  const cols = Object.keys(opp.best_odds).length>2?'3':'2';
+  const isValue = kind === "value";
+  const confClass = opp.confidence >= 7 ? "conf-high" : opp.confidence >= 4 ? "conf-mid" : "conf-low";
+  const confTooltip = `Score confiance basé sur : ${opp.book_count}/4 books, variance ligne ${opp.market==='totals'?'O/U':'cote'}, temps avant match, magnitude edge`;
+
+  // Variance des lignes O/U pour affichage
+  const lineVariance = opp.market === "totals" && opp.line_consensus
+    ? Object.values(opp.line_consensus).map(c => c.variance).filter(v => v > 0)
+    : [];
+  const maxLineVar = lineVariance.length ? Math.max(...lineVariance) : 0;
+
+  // Recherche match
+  const researchUrl = RESEARCH_LINKS[opp.sport_research]?.(opp.event) || "";
+
+  return `
+    <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 hover:border-emerald-700 transition ${isFresh?'new-opp border-emerald-500':''}">
+      <div class="flex justify-between items-start mb-3 gap-3">
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2 mb-1 flex-wrap">
+            <span class="bg-slate-800 text-emerald-400 text-xs px-2 py-0.5 rounded">${opp.sport_emoji||""} ${escapeHtml(opp.sport)}</span>
+            <span class="bg-slate-800 text-cyan-400 text-xs px-2 py-0.5 rounded">${escapeHtml(opp.market_label||opp.market||"h2h")}</span>
+            <span title="${confTooltip}" class="${confClass} text-white text-xs px-2 py-0.5 rounded font-semibold">conf ${opp.confidence}/10</span>
+            <span class="text-xs text-slate-500">${new Date(opp.start_time).toLocaleString("fr-FR")}</span>
+            <span class="text-xs px-1.5 py-0.5 rounded ${opp.start_time<new Date().toISOString()?'bg-red-900/50 text-red-300':'bg-slate-800 text-slate-400'}">${timeUntil(opp.start_time)}</span>
+            <span class="text-xs text-slate-500">${opp.book_count}/4 books</span>
+            ${opp.market === "totals" && maxLineVar > 1.5 ? `<span class="text-xs text-amber-400" title="Lignes très différentes entre books — méfiance">⚠ ligne ±${maxLineVar}</span>` : ""}
+            ${researchUrl ? `<a href="${escapeAttr(researchUrl)}" target="_blank" rel="noopener" class="text-xs text-cyan-400 hover:underline">🔍 recherche</a>` : ""}
+          </div>
+          <h3 class="font-semibold text-lg truncate">${escapeHtml(opp.event)}</h3>
+        </div>
+        <div class="text-right shrink-0">
+          ${isValue
+            ? `<div class="text-3xl font-bold text-cyan-400">+${opp.max_edge}%</div>
+               <div class="text-xs text-slate-500">edge value</div>`
+            : `<div class="text-3xl font-bold ${arbColor}">+${opp.arb_pct}%</div>
+               <div class="text-xs text-slate-500">score ${opp.value_score}</div>`}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-${cols} gap-3 text-sm">
+        ${Object.entries(opp.best_odds).map(([k,v]) => {
+          const fair = opp.fair_odds?.[k];
+          const edge = opp.edges?.[k];
+          const kelly = fair && isValue ? kellyStake(v, fair, state.bankroll, state.kellyFraction) : 0;
+          const lineInfo = opp.line_consensus?.[k.split(" ").slice(0,-1).join(" ")] || opp.line_consensus?.[k.split(" ")[0]];
+          return `
+            <div class="bg-slate-800 rounded p-3 transition group">
+              <div class="flex justify-between items-start gap-2">
+                <div class="min-w-0 flex-1">
+                  <div class="font-medium truncate">${escapeHtml(k)}</div>
+                  <div class="text-xs text-slate-400 mt-1 flex items-center gap-2 flex-wrap">
+                    <a href="${BOOK_URLS[opp.book_keys[k]]||'#'}" target="_blank" rel="noopener"
+                       class="px-1.5 py-0.5 rounded text-[10px] ${BOOK_COLORS[opp.book_keys[k]]||'bg-slate-700'} hover:underline">
+                      ${escapeHtml(opp.books[k])} ↗
+                    </a>
+                    ${isValue
+                      ? `<span title="Cote équitable estimée">fair ${fair?.toFixed(2)}</span>
+                         ${edge>0?`<span class="text-cyan-400 font-semibold">+${edge}% edge</span>`:""}`
+                      : `<span>mise <strong>${stakes[k]} €</strong></span>`}
+                    ${lineInfo && opp.market==="totals" ? `<span class="text-[10px] text-slate-500" title="Min-max-moy ligne O/U entre books">L:${lineInfo.min}-${lineInfo.max} (moy ${lineInfo.avg})</span>` : ""}
+                  </div>
+                  ${isValue && kelly>0
+                    ? `<div class="text-xs text-amber-400 mt-1">Kelly 1/4 : <strong>${kelly} €</strong></div>`
+                    : ""}
+                </div>
+                <div class="text-2xl font-bold ml-2">${v}</div>
+              </div>
+              <button class="quick-bet mt-2 w-full text-xs bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 py-1 rounded"
+                data-opp='${escapeAttr(JSON.stringify({
+                  sport: opp.sport, event: opp.event, market: opp.market,
+                  selection: k, book: opp.books[k], odds: v,
+                  stake: isValue && kelly>0 ? kelly : stakes[k],
+                  type: isValue ? "value" : "arb",
+                  confidence: opp.confidence,
+                  opportunity_id: opp.id,
+                  sport_key: opp.sport_key,
+                  event_start: opp.start_time,
+                }))}'>
+                + Ajouter au tracker
+              </button>
+            </div>
+          `;
+        }).join("")}
+      </div>
+
+      <div class="mt-3 pt-3 border-t border-slate-800 flex justify-between items-center text-sm flex-wrap gap-2">
+        ${isValue
+          ? `<span class="text-slate-400">Bankroll : <strong>${state.bankroll} €</strong></span>
+             <span class="text-cyan-400">Edge max : <strong>+${opp.max_edge}%</strong></span>`
+          : `<span class="text-slate-400">Mise totale : <strong>${state.stake} €</strong></span>
+             <span class="${profit>0?'text-emerald-400':'text-amber-400'}">
+               ${profit>0?'Profit garanti':'Perte max'} : <strong>${profit>0?'+':''}${profit} €</strong>
+               (ROI ${roi}%)
+             </span>`}
+        <button data-hide="${opp.id}" class="hide-btn text-xs text-slate-500 hover:text-red-400">✕ masquer</button>
+      </div>
+    </div>
+  `;
+}
+
+/* ====== TRACKER TAB ====== */
+function renderTrackerTab() {
+  const pending = state.bets.filter(b => b.status === "pending");
+  const settled = state.bets.filter(b => b.status !== "pending");
+  const stats = computeStats();
+  return `
+    <!-- ALERTE MM -->
+    ${state.mmEnabled ? `
+      <section class="bg-slate-900 rounded-lg p-3 mb-4 text-xs flex flex-wrap gap-3 items-center">
+        <span class="text-slate-400">🛡️ Money management actif :</span>
+        <span>mise max <strong>${(stats.currentBankroll * state.maxBetPct/100).toFixed(0)}€</strong> (${state.maxBetPct}%)</span>
+        <span>·</span>
+        <span>perdu aujourd'hui <strong class="${stats.todayLosses >= stats.currentBankroll*state.dailyLossLimitPct/100 ? 'text-red-400':''}">${stats.todayLosses.toFixed(0)}€</strong> / max ${(stats.currentBankroll*state.dailyLossLimitPct/100).toFixed(0)}€</span>
+        ${state.pausedUntil > Date.now() ? `<span class="text-amber-400 ml-auto">⏸ cooldown ${Math.ceil((state.pausedUntil-Date.now())/60000)}min</span>` : ""}
+      </section>
+    ` : `<p class="text-xs text-slate-500 mb-4">Money management désactivé. <a href="#" data-tab="settings" class="goto-tab text-cyan-400 hover:underline">Activer dans Réglages</a>.</p>`}
+
+    <!-- AJOUTER -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">➕ Ajouter un pari manuel</h2>
+      <form id="addBetForm" class="grid grid-cols-2 md:grid-cols-7 gap-2 text-sm">
+        <input name="sport" placeholder="Sport (NBA…)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" required />
+        <input name="event" placeholder="Match" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-2" required />
+        <input name="selection" placeholder="Sélection" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" required />
+        <select name="book" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" required>
+          ${FRENCH_BOOKMAKERS.map(b => `<option value="${BOOK_LABELS[b]}">${BOOK_LABELS[b]}</option>`).join("")}
+        </select>
+        <input name="odds" type="number" step="0.01" min="1.01" placeholder="Cote" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" required />
+        <input name="stake" type="number" step="0.01" min="0.01" placeholder="Mise (€)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" required />
+        <input name="market" placeholder="Marché" value="h2h" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-1" />
+        <input name="note" placeholder="Note" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 col-span-3" />
+        <button type="submit" class="bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-semibold py-1.5 rounded col-span-3">Ajouter</button>
+      </form>
+    </section>
+
+    <!-- BANKROLL -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <div class="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h2 class="text-sm font-semibold text-slate-300">💰 Bankroll de départ</h2>
+          <p class="text-xs text-slate-500">Sert de base pour ROI, Kelly, money management</p>
+        </div>
+        <input id="bankroll" type="number" min="0" value="${state.bankroll}"
+          class="w-32 bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm text-right" />
+        <button id="exportBetsCsv" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded text-xs">⤓ CSV paris</button>
+      </div>
+    </section>
+
+    <!-- PENDING -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">⏳ Paris en attente (${pending.length})</h2>
+      ${pending.length === 0 ? `<p class="text-xs text-slate-500">Aucun pari en attente.</p>` : `
+        <div class="overflow-auto scrollbar">
+          <table class="w-full text-xs">
+            <thead class="text-slate-400 text-left">
+              <tr><th class="py-2">Date</th><th>Sport</th><th>Match</th><th>Sélection</th><th>Book</th><th>Cote</th><th>Mise</th><th>Conf</th><th>Gain pot.</th><th>Statut</th></tr>
+            </thead>
+            <tbody>
+              ${pending.map(b => `
+                <tr class="border-t border-slate-800">
+                  <td class="py-2 text-slate-500">${new Date(b.date).toLocaleDateString("fr-FR")}</td>
+                  <td>${escapeHtml(b.sport)}</td>
+                  <td>${escapeHtml(b.event)}</td>
+                  <td>${escapeHtml(b.selection)}</td>
+                  <td><span class="text-xs px-1.5 py-0.5 rounded bg-slate-800">${escapeHtml(b.book)}</span></td>
+                  <td class="font-mono">${b.odds}</td>
+                  <td>${b.stake} €</td>
+                  <td>${b.confidence ? b.confidence+"/10" : "-"}</td>
+                  <td class="text-emerald-400">+${r2(b.stake*(b.odds-1))} €</td>
+                  <td class="flex gap-1">
+                    <button data-settle="${b.id}" data-status="won"  class="settle-btn bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] px-2 py-0.5 rounded">Gagné</button>
+                    <button data-settle="${b.id}" data-status="lost" class="settle-btn bg-red-600 hover:bg-red-700 text-white text-[10px] px-2 py-0.5 rounded">Perdu</button>
+                    <button data-settle="${b.id}" data-status="push" class="settle-btn bg-slate-600 hover:bg-slate-700 text-white text-[10px] px-2 py-0.5 rounded">Push</button>
+                    <button data-delete="${b.id}" class="del-btn text-slate-500 hover:text-red-400 text-[10px] px-1">✕</button>
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </section>
+
+    <!-- HISTORIQUE -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">📜 Historique paris (${settled.length})</h2>
+      ${settled.length === 0 ? `<p class="text-xs text-slate-500">Aucun pari réglé.</p>` : `
+        <div class="overflow-auto scrollbar max-h-[500px]">
+          <table class="w-full text-xs">
+            <thead class="text-slate-400 text-left sticky top-0 bg-slate-900">
+              <tr><th class="py-2">Date</th><th>Sport</th><th>Match</th><th>Sélection</th><th>Book</th><th>Cote</th><th>Mise</th><th>CLV</th><th>Profit</th><th>Statut</th><th></th></tr>
+            </thead>
+            <tbody>
+              ${settled.slice(0,200).map(b => {
+                const p = profitOf(b);
+                const colorCls = p>0?"text-emerald-400":p<0?"text-red-400":"text-slate-400";
+                const statusCls = b.status==="won"?"bg-emerald-900/40 text-emerald-300":b.status==="lost"?"bg-red-900/40 text-red-300":"bg-slate-800 text-slate-300";
+                const clvCls = b.clv_pct === null || b.clv_pct === undefined ? "text-slate-600" : b.clv_pct>0?"text-emerald-400":"text-red-400";
+                return `
+                  <tr class="border-t border-slate-800">
+                    <td class="py-2 text-slate-500">${new Date(b.date).toLocaleDateString("fr-FR")}</td>
+                    <td>${escapeHtml(b.sport)}</td>
+                    <td>${escapeHtml(b.event)}</td>
+                    <td>${escapeHtml(b.selection)}</td>
+                    <td><span class="text-xs px-1.5 py-0.5 rounded bg-slate-800">${escapeHtml(b.book)}</span></td>
+                    <td class="font-mono">${b.odds}</td>
+                    <td>${b.stake} €</td>
+                    <td class="${clvCls}" title="${b.clv_pct !== null && b.clv_pct !== undefined ? 'CLV : ta cote vs cote de fermeture. Positif = tu bats le marché' : 'CLV non capturé : l\'app n\'a pas pu re-fetch les cotes avant le coup d\'envoi. Rouvre l\'app dans les 30 min avant un match pour activer la capture.'}">${b.clv_pct !== null && b.clv_pct !== undefined ? (b.clv_pct>=0?"+":"")+b.clv_pct+"%" : "—"}</td>
+                    <td class="${colorCls} font-semibold">${fmtEur(p)}</td>
+                    <td><span class="text-xs px-1.5 py-0.5 rounded ${statusCls}">${b.status}</span></td>
+                    <td><button data-delete="${b.id}" class="del-btn text-slate-500 hover:text-red-400 text-[10px] px-1">✕</button></td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </section>
+  `;
+}
+
+/* ====== STATS TAB ====== */
+function renderStatsTab() {
+  const s = computeStats();
+  const sportRows = Object.entries(s.bySport).sort((a,b)=>b[1].profit-a[1].profit);
+  const bookRows  = Object.entries(s.byBook).sort((a,b)=>b[1].profit-a[1].profit);
+  const profitColor = n => n>0?"text-emerald-400":n<0?"text-red-400":"text-slate-300";
+
+  return `
+    <!-- KPIs -->
+    <section class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Bankroll actuelle</div>
+        <div class="text-2xl font-bold ${s.currentBankroll>=state.bankroll?'text-emerald-400':'text-red-400'}">${s.currentBankroll} €</div>
+        <div class="text-[10px] text-slate-500">départ ${state.bankroll} €</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Profit total</div>
+        <div class="text-2xl font-bold ${profitColor(s.totalProfit)}">${fmtEur(s.totalProfit)}</div>
+        <div class="text-[10px] text-slate-500">aujourd'hui ${fmtEur(s.todayProfit)}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Yield</div>
+        <div class="text-2xl font-bold ${profitColor(s.yieldPct)}">${s.yieldPct}%</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Win rate</div>
+        <div class="text-2xl font-bold">${s.winRate}%</div>
+        <div class="text-[10px] text-slate-500">${s.won}W / ${s.lost}L sur ${s.nbSettled}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3" title="Closing Line Value moyen — l'indicateur le plus fiable de skill réel.&#10;⚠ Capturé seulement si tu rouvres l'app entre le moment du pari et le coup d'envoi (limite Service Worker iOS).&#10;Pour les paris où l'app n'a pas pu capturer la cote de fermeture, le CLV reste vide.">
+        <div class="text-xs text-slate-400">CLV moyen 🎯 <span class="text-slate-600 cursor-help">ⓘ</span></div>
+        <div class="text-2xl font-bold ${s.avgClv === null ? 'text-slate-600' : profitColor(s.avgClv)}">${s.avgClv === null ? "—" : (s.avgClv>=0?"+":"")+s.avgClv+"%"}</div>
+        <div class="text-[10px] text-slate-500">${s.nbWithClv}/${s.nbSettled} paris capturés${s.positiveClvRate !== null ? ` · ${r2(s.positiveClvRate)}% positif`:""}</div>
+      </div>
+      <div class="bg-slate-900 rounded-lg p-3">
+        <div class="text-xs text-slate-400">Streak</div>
+        <div class="text-2xl font-bold ${s.currentStreak.type==='won'?'text-emerald-400':s.currentStreak.type==='lost'?'text-red-400':''}">
+          ${s.currentStreak.count||0} ${s.currentStreak.type==='won'?'W':s.currentStreak.type==='lost'?'L':''}
+        </div>
+        <div class="text-[10px] text-slate-500">max W:${s.longestWin} · L:${s.longestLoss}</div>
+      </div>
+    </section>
+
+    <!-- INTERPRÉTATION CLV -->
+    ${s.avgClv !== null ? `
+    <section class="bg-slate-900 rounded-lg p-4 mb-4 text-sm">
+      <h3 class="font-semibold text-slate-300 mb-2">🎯 Lecture de ton CLV</h3>
+      <p class="text-slate-400 text-xs mb-2">
+        Le CLV (Closing Line Value) compare ta cote au moment du pari à la cote de fermeture juste avant le coup d'envoi.
+        Si tu prends régulièrement de meilleures cotes que celles de fermeture, tu bats le marché — c'est le seul vrai indicateur de skill (au-dessus du win rate ou du yield à court terme).
+      </p>
+      <p class="text-slate-500 text-[11px] mb-2 italic">
+        ⚠ Limite technique : la capture nécessite que tu rouvres l'app dans les ~30 min avant le coup d'envoi de chaque pari.
+        iOS Safari ne permet pas de tâche d'arrière-plan fiable. Tes paris où l'app n'a pas pu re-fetch resteront avec un CLV vide — c'est normal.
+        Pour 100% de capture : laisse l'app installée sur l'écran d'accueil et ouvre-la rapidement avant chaque match.
+      </p>
+      <p class="${s.avgClv>=2?'text-emerald-400':s.avgClv>=0?'text-amber-400':'text-red-400'} font-semibold">
+        ${s.avgClv>=3?"🔥 Excellent : tu bats clairement le marché. Si la variance ne te tue pas, tu es profitable à long terme.":
+          s.avgClv>=1?"✅ Bon CLV positif. Continue, mais besoin de plus de paris pour confirmer.":
+          s.avgClv>=0?"⚠️ CLV légèrement positif mais marginal. Évalue si l'edge couvre la marge bookmaker.":
+          "❌ CLV négatif : tu prends des cotes que le marché juge trop élevées. Soit tu es chanceux à court terme, soit tu es perdant à long terme."}
+      </p>
+    </section>` : ""}
+
+    <!-- GRAPH BANKROLL -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">📈 Évolution du bankroll</h2>
+      ${s.bankrollSeries.length<=1
+        ? `<p class="text-xs text-slate-500">Règle au moins un pari pour voir l'évolution.</p>`
+        : `<div class="relative" style="height:280px;"><canvas id="bankrollChart"></canvas></div>`}
+    </section>
+
+    <!-- PAR SPORT -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">🏆 Performance par sport</h2>
+      ${sportRows.length === 0 ? `<p class="text-xs text-slate-500">Pas de données.</p>` : `
+        <table class="w-full text-xs">
+          <thead class="text-slate-400 text-left">
+            <tr><th class="py-2">Sport</th><th>Paris</th><th>Win rate</th><th>Mise</th><th>Profit</th><th>Yield</th></tr>
+          </thead>
+          <tbody>
+            ${sportRows.map(([sport, st]) => `
+              <tr class="border-t border-slate-800">
+                <td class="py-2">${escapeHtml(sport)}</td>
+                <td>${st.count}</td>
+                <td>${r2(st.winRate)}%</td>
+                <td>${r2(st.stake)} €</td>
+                <td class="${profitColor(st.profit)} font-semibold">${fmtEur(st.profit)}</td>
+                <td class="${profitColor(st.yield)}">${r2(st.yield)}%</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `}
+    </section>
+
+    <!-- PAR BOOK -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">🏦 Performance par bookmaker</h2>
+      ${bookRows.length === 0 ? `<p class="text-xs text-slate-500">Pas de données.</p>` : `
+        <table class="w-full text-xs">
+          <thead class="text-slate-400 text-left">
+            <tr><th class="py-2">Book</th><th>Paris</th><th>Win rate</th><th>Mise</th><th>Profit</th><th>Yield</th></tr>
+          </thead>
+          <tbody>
+            ${bookRows.map(([book, st]) => `
+              <tr class="border-t border-slate-800">
+                <td class="py-2">${escapeHtml(book)}</td>
+                <td>${st.count}</td>
+                <td>${r2(st.winRate)}%</td>
+                <td>${r2(st.stake)} €</td>
+                <td class="${profitColor(st.profit)} font-semibold">${fmtEur(st.profit)}</td>
+                <td class="${profitColor(st.yield)}">${r2(st.yield)}%</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `}
+    </section>
+
+    <!-- PAR BUCKET COTE -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">🎚 Performance par tranche de cote</h2>
+      <table class="w-full text-xs">
+        <thead class="text-slate-400 text-left">
+          <tr><th class="py-2">Tranche</th><th>Paris</th><th>Win rate</th><th>Mise</th><th>Profit</th><th>Yield</th></tr>
+        </thead>
+        <tbody>
+          ${s.byBucket.map(b => `
+            <tr class="border-t border-slate-800 ${b.count===0?'opacity-40':''}">
+              <td class="py-2">${b.label}</td>
+              <td>${b.count}</td>
+              <td>${b.count?r2(b.winRate)+'%':'—'}</td>
+              <td>${b.count?r2(b.stake)+' €':'—'}</td>
+              <td class="${profitColor(b.profit)} font-semibold">${b.count?fmtEur(b.profit):'—'}</td>
+              <td class="${profitColor(b.yield)}">${b.count?r2(b.yield)+'%':'—'}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </section>
+  `;
+}
+
+function renderBankrollChart() {
+  const s = computeStats();
+  if (s.bankrollSeries.length <= 1) return;
+  const canvas = document.getElementById("bankrollChart");
+  if (!canvas) return;
+  if (state.bankrollChart) state.bankrollChart.destroy();
+  const labels = s.bankrollSeries.map((p,i) => i===0?"Départ":new Date(p.x).toLocaleDateString("fr-FR",{month:"short",day:"numeric"}));
+  const data   = s.bankrollSeries.map(p => p.y);
+  state.bankrollChart = new Chart(canvas, {
+    type: "line",
+    data: { labels, datasets: [{
+      label: "Bankroll (€)", data,
+      borderColor: "#10b981", backgroundColor: "rgba(16,185,129,0.15)",
+      tension: 0.25, fill: true, pointRadius: 3, pointHoverRadius: 6,
+    }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: "#cbd5e1" } }, tooltip: { mode: "index", intersect: false } },
+      scales: {
+        x: { ticks: { color: "#64748b", maxRotation:0, autoSkip:true, maxTicksLimit:10 }, grid: { color: "#1e293b" } },
+        y: { ticks: { color: "#64748b" }, grid: { color: "#1e293b" } },
+      },
+    },
+  });
+}
+
+/* ====== SETTINGS TAB ====== */
+function renderSettingsTab() {
+  return `
+    <!-- ALERTES -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">🔔 Alertes</h2>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">📱 Topic ntfy.sh</label>
+          <div class="flex gap-2">
+            <input id="ntfy" type="text" value="${escapeAttr(state.ntfyTopic)}" class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+            <button id="testAlert" ${!state.ntfyTopic?"disabled":""} class="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-slate-100 px-3 py-2 rounded text-xs">Test</button>
+          </div>
+        </div>
+        <div class="flex flex-col justify-end gap-2">
+          <label class="flex items-center gap-2 text-sm"><input id="alerts" type="checkbox" ${state.alertsEnabled?"checked":""} /><span>📱 Push iPhone</span></label>
+          <label class="flex items-center gap-2 text-sm"><input id="sound" type="checkbox" ${state.soundEnabled?"checked":""} /><span>🔊 Bip sonore</span></label>
+          <label class="flex items-center gap-2 text-sm"><input id="desktop" type="checkbox" ${state.desktopNotif?"checked":""} /><span>💻 Notif système</span></label>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Notif arb ≥ %</label>
+            <input id="notifyArb" type="number" step="0.1" value="${state.notifyArb}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Urgent ≥ %</label>
+            <input id="urgentArb" type="number" step="0.1" value="${state.urgentArb}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+          </div>
+          <div class="col-span-2">
+            <label class="block text-xs text-slate-400 mb-1">Notif uniquement si conf ≥</label>
+            <input id="notifyConfidence" type="number" min="0" max="10" value="${state.notifyConfidence}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+          </div>
+        </div>
+      </div>
+      <button id="resetNotified" class="text-xs text-slate-400 hover:text-slate-200">↺ Reset historique alertes</button>
+    </section>
+
+    <!-- SMART REFRESH -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">⚡ Refresh & quota API</h2>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+        <label class="flex flex-col col-span-2">
+          <span class="text-xs text-slate-400 mb-1">Adaptive refresh (économie quota)</span>
+          <label class="flex items-center gap-2"><input id="adaptiveRefresh" type="checkbox" ${state.adaptiveRefresh?"checked":""} /><span>Activer (recommandé)</span></label>
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Refresh base (s)</span>
+          <input id="refreshSec" type="number" min="20" max="3600" value="${state.refreshSec}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Cache cotes (ms)</span>
+          <input id="cacheMs" type="number" min="0" max="600000" value="${state.cacheMs}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Pause si quota &lt;</span>
+          <input id="apiPauseAt" type="number" min="0" value="${state.apiPauseAt}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Fenêtre scan (min, 0=∞)</span>
+          <input id="scanWindowMin" type="number" min="0" value="${state.scanWindowMin}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" title="Ne scanner que les events qui commencent dans X minutes (0 = pas de limite)" />
+        </label>
+      </div>
+      ${state.adaptiveReasons?.length ? `
+        <p class="text-xs text-slate-500 mt-3">Multiplicateur actuel ×${state.lastRefreshFactor.toFixed(1)} → ${state.adaptiveReasons.join(" + ")}</p>
+      ` : `<p class="text-xs text-slate-500 mt-3">L'adaptive refresh ralentit le scan automatiquement la nuit, quand le quota baisse, quand rien n'est trouvé, ou quand l'onglet est en arrière-plan. Économie typique : 60–85% du quota.</p>`}
+    </section>
+
+    <!-- MONEY MANAGEMENT -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">🛡️ Money management (anti-tilt)</h2>
+      <label class="flex items-center gap-2 text-sm mb-3"><input id="mmEnabled" type="checkbox" ${state.mmEnabled?"checked":""} /><span>Activer les protections (recommandé)</span></label>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Mise max (% bankroll)</span>
+          <input id="maxBetPct" type="number" step="0.5" min="0.1" max="100" value="${state.maxBetPct}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Stop-loss journalier (%)</span>
+          <input id="dailyLossLimitPct" type="number" step="1" min="1" max="100" value="${state.dailyLossLimitPct}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Cooldown après N défaites</span>
+          <input id="cooldownLosses" type="number" min="2" max="20" value="${state.cooldownLosses}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Durée cooldown (min)</span>
+          <input id="cooldownMin" type="number" min="5" max="1440" value="${state.cooldownMin}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+      </div>
+      ${state.pausedUntil > Date.now() ? `<button id="forceResume" class="mt-3 text-xs text-amber-400 hover:text-amber-300">Forcer reprise (déconseillé)</button>` : ""}
+    </section>
+
+    <!-- VALUE BETTING -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">💎 Value betting</h2>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Edge minimum (%)</span>
+          <input id="valueEdge" type="number" step="0.5" min="0" value="${state.valueEdge}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" />
+        </label>
+        <label>
+          <span class="text-xs text-slate-400 mb-1 block">Fraction Kelly</span>
+          <input id="kellyFraction" type="number" step="0.05" min="0" max="1" value="${state.kellyFraction}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm" title="0.25 = Kelly fractionné 1/4 (prudent). 1 = full Kelly (volatile)" />
+        </label>
+        <label class="col-span-2">
+          <span class="text-xs text-slate-400 mb-1 block">Tracking CLV (Closing Line Value)</span>
+          <label class="flex items-center gap-2"><input id="clvEnabled" type="checkbox" ${state.clvEnabled?"checked":""} /><span>Capturer auto la cote de fermeture (consomme +1 req/pari, ~30 min avant kickoff)</span></label>
+        </label>
+      </div>
+    </section>
+
+    <!-- INFOS -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4 text-xs text-slate-400">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">ℹ Conseils d'utilisation</h2>
+      <ul class="space-y-1 list-disc list-inside">
+        <li>Pour économiser le quota : Adaptive refresh ON + base 60s + sports limités à NBA + Ligue 1</li>
+        <li>Pour les notifications : seuil arb 2.5% + confiance 6/10 minimum (filtre le bruit)</li>
+        <li>Pour le money management : 5% mise max + 10% stop-loss journalier sont des standards prudents</li>
+        <li>Le CLV se calcule automatiquement quand un match commence — checke tes stats après quelques semaines</li>
+        <li>📱 Sur iPhone : <strong>Safari → Partager → Sur l'écran d'accueil</strong> pour avoir l'app comme une vraie appli</li>
+      </ul>
+    </section>
+  `;
+}
+
+/* ====== ÉVÉNEMENTS ====== */
+function attachListeners() {
+  const $ = id => document.getElementById(id);
+
+  document.querySelectorAll(".tab-btn").forEach(b => {
+    b.addEventListener("click", () => {
+      state.tab = b.dataset.tab;
+      save("arb_tab", state.tab);
+      render();
+    });
+  });
+  document.querySelectorAll(".goto-tab").forEach(a => {
+    a.addEventListener("click", e => { e.preventDefault(); state.tab = a.dataset.tab; save("arb_tab", state.tab); render(); });
+  });
+
+  if (state.tab === "scanner")  attachScannerListeners();
+  if (state.tab === "tracker")  attachTrackerListeners();
+  if (state.tab === "settings") attachSettingsListeners();
+}
+
+function attachScannerListeners() {
+  const $ = id => document.getElementById(id);
+
+  $("apiKey")?.addEventListener("input", e => {
+    const wasEmpty = !state.apiKey;
+    state.apiKey = e.target.value.trim(); save("arb_apikey", state.apiKey);
+    if (state.apiKey && wasEmpty) startTimer();
+  });
+  $("stake")?.addEventListener("input", e => { state.stake = Number(e.target.value)||0; save("arb_stake", state.stake); render(); });
+  $("minArb")?.addEventListener("change", e => { state.minArb = Number(e.target.value); MIN_ARB_PCT = state.minArb; save("arb_min", state.minArb); refresh(); });
+  $("minConfidence")?.addEventListener("change", e => { state.minConfidence = Number(e.target.value); save("arb_min_conf", state.minConfidence); refresh(); });
+  $("sortBy")?.addEventListener("change", e => { state.sortBy = e.target.value; save("arb_sort", state.sortBy); refresh(); });
+  $("refresh")?.addEventListener("click", refresh);
+
+  document.querySelectorAll(".sport-toggle").forEach(cb => cb.addEventListener("change", e => {
+    state.enabledSports[e.target.dataset.sport] = e.target.checked; save("arb_sports", state.enabledSports); refresh();
+  }));
+  $("sportsAll")?.addEventListener("click", () => { SPORTS.forEach(s => state.enabledSports[s.key] = true); save("arb_sports", state.enabledSports); refresh(); });
+  $("sportsNone")?.addEventListener("click", () => { SPORTS.forEach(s => state.enabledSports[s.key] = false); save("arb_sports", state.enabledSports); refresh(); });
+  $("sportsKey")?.addEventListener("click", () => {
+    const w = ["basketball_nba","soccer_france_ligue_one","soccer_uefa_champs_league","soccer_epl","soccer_spain_la_liga","soccer_italy_serie_a","tennis_atp"];
+    SPORTS.forEach(s => state.enabledSports[s.key] = w.includes(s.key)); save("arb_sports", state.enabledSports); refresh();
+  });
+  $("sportsEss")?.addEventListener("click", () => {
+    const w = ["basketball_nba","soccer_france_ligue_one"];
+    SPORTS.forEach(s => state.enabledSports[s.key] = w.includes(s.key)); save("arb_sports", state.enabledSports); refresh();
+  });
+
+  // Activation/désactivation par catégorie
+  document.querySelectorAll(".cat-all").forEach(b => b.addEventListener("click", e => {
+    e.preventDefault();
+    const cat = b.dataset.cat;
+    SPORTS.filter(s => s.cat === cat).forEach(s => state.enabledSports[s.key] = true);
+    save("arb_sports", state.enabledSports); refresh();
+  }));
+  document.querySelectorAll(".cat-none").forEach(b => b.addEventListener("click", e => {
+    e.preventDefault();
+    const cat = b.dataset.cat;
+    SPORTS.filter(s => s.cat === cat).forEach(s => state.enabledSports[s.key] = false);
+    save("arb_sports", state.enabledSports); refresh();
+  }));
+
+  $("exportJson")?.addEventListener("click", exportJSON);
+  $("exportCsv")?.addEventListener("click", exportCSV);
+
+  document.querySelectorAll(".hide-btn").forEach(b => b.addEventListener("click", () => {
+    state.hidden[b.dataset.hide] = true; save("arb_hidden", state.hidden); refresh();
+  }));
+
+  document.querySelectorAll(".quick-bet").forEach(b => b.addEventListener("click", () => {
+    try {
+      const data = JSON.parse(b.dataset.opp);
+      const opp = { id: data.opportunity_id, confidence: data.confidence };
+      const bet = addBet(data, opp);
+      if (bet) {
+        // attache les infos pour CLV
+        bet.sport_key = data.sport_key;
+        bet.event_start = data.event_start;
+        save("arb_bets", state.bets);
+        b.textContent = "✓ Ajouté"; b.classList.add("opacity-60"); b.disabled = true;
+      }
+    } catch(e) { console.error(e); alert("Erreur ajout pari : " + e.message); }
+  }));
+
+  $("clearHistory")?.addEventListener("click", () => {
+    if (!confirm("Effacer tout l'historique ?")) return;
+    state.history = []; save("arb_history", []); render();
+  });
+}
+
+function attachTrackerListeners() {
+  const $ = id => document.getElementById(id);
+  $("bankroll")?.addEventListener("change", e => { state.bankroll = Number(e.target.value)||0; save("arb_bankroll", state.bankroll); render(); });
+  $("addBetForm")?.addEventListener("submit", e => {
+    e.preventDefault();
+    const fd = new FormData(e.target); const obj = {}; fd.forEach((v,k) => obj[k] = v);
+    const bet = addBet(obj);
+    if (bet) render();
+  });
+  document.querySelectorAll(".settle-btn").forEach(b => b.addEventListener("click", () => { settleBet(b.dataset.settle, b.dataset.status); render(); }));
+  document.querySelectorAll(".del-btn").forEach(b => b.addEventListener("click", () => { if (confirm("Supprimer ?")) { deleteBet(b.dataset.delete); render(); } }));
+  $("exportBetsCsv")?.addEventListener("click", exportBetsCSV);
+}
+
+function attachSettingsListeners() {
+  const $ = id => document.getElementById(id);
+  const numHandler = (id, key, save_key) => $(id)?.addEventListener("change", e => { state[key] = Number(e.target.value); save(save_key, state[key]); });
+  const boolHandler = (id, key, save_key) => $(id)?.addEventListener("change", e => { state[key] = e.target.checked; save(save_key, state[key]); });
+
+  numHandler("notifyArb",         "notifyArb",         "arb_notify");
+  numHandler("urgentArb",         "urgentArb",         "arb_urgent");
+  numHandler("notifyConfidence",  "notifyConfidence",  "arb_notify_conf");
+  numHandler("refreshSec",        "refreshSec",        "arb_refresh");
+  numHandler("cacheMs",           "cacheMs",           "arb_cache_ms");
+  numHandler("apiPauseAt",        "apiPauseAt",        "arb_api_pause");
+  numHandler("scanWindowMin",     "scanWindowMin",     "arb_scan_window");
+  numHandler("maxBetPct",         "maxBetPct",         "arb_max_bet_pct");
+  numHandler("dailyLossLimitPct", "dailyLossLimitPct", "arb_daily_loss");
+  numHandler("cooldownLosses",    "cooldownLosses",    "arb_cooldown");
+  numHandler("cooldownMin",       "cooldownMin",       "arb_cooldown_min");
+  numHandler("valueEdge",         "valueEdge",         "arb_value_edge");
+  numHandler("kellyFraction",     "kellyFraction",     "arb_kelly_fr");
+
+  boolHandler("alerts",          "alertsEnabled", "arb_alerts");
+  boolHandler("sound",           "soundEnabled",  "arb_sound");
+  boolHandler("adaptiveRefresh", "adaptiveRefresh","arb_adaptive");
+  boolHandler("mmEnabled",       "mmEnabled",     "arb_mm_on");
+  boolHandler("clvEnabled",      "clvEnabled",    "arb_clv_on");
+
+  $("ntfy")?.addEventListener("input", e => { state.ntfyTopic = e.target.value.trim(); save("arb_ntfy", state.ntfyTopic); });
+  $("desktop")?.addEventListener("change", async e => {
+    if (e.target.checked && "Notification" in window) {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { e.target.checked = false; alert("Notifications bloquées."); return; }
+    }
+    state.desktopNotif = e.target.checked; save("arb_desktop", state.desktopNotif);
+  });
+  $("testAlert")?.addEventListener("click", async () => {
+    if (!state.ntfyTopic) return;
+    await fetch("https://ntfy.sh", {
+      method: "POST",
+      body: JSON.stringify({ topic: state.ntfyTopic, title: "✅ Test v3", message: "OK 🎯", priority: 4, tags:["white_check_mark"] }),
+    });
+    alert("Notification envoyée !");
+  });
+  $("resetNotified")?.addEventListener("click", () => {
+    if (!confirm("Reset historique alertes ?")) return;
+    state.notified = {}; localStorage.removeItem("arb_notified"); alert("OK.");
+  });
+  $("forceResume")?.addEventListener("click", () => {
+    if (!confirm("Forcer la fin du cooldown ? (déconseillé après une mauvaise série)")) return;
+    state.pausedUntil = 0; save("arb_paused_until", 0); render();
+  });
+}
+
+/* ====== BOUCLE PRINCIPALE ====== */
+async function refresh() {
+  if (!state.apiKey) return;
+  if (state.scanLock) { console.warn("[arb] scan déjà en cours"); return; }
+  state.scanLock = true;
+  state.loading = true; state.error = null; render();
+  try {
+    const result = await getTopOpportunities(state.apiKey);
+    state.data = result.arbs;
+    state.valueBets = result.values;
+    state.lastUpdate = new Date();
+    state.scanCount++;
+    save("arb_scan_count", state.scanCount);
+    checkAlerts(state.data);
+    // CLV capture en arrière-plan
+    if (state.clvEnabled) captureClosingOdds().catch(e => console.warn("[CLV bg]", e));
+    // Adaptive : suivi des scans vides
+    if (result.arbs.length === 0 && result.values.length === 0) state.recentEmptyScans++;
+    else state.recentEmptyScans = 0;
+  } catch(e) {
+    console.error("[arb]", e);
+    state.error = e.message;
+  } finally {
+    state.loading = false;
+    state.scanLock = false;
+    state.nextRefreshSec = computeAdaptiveDelay();
+    state.countdown = state.nextRefreshSec;
+    render();
+    rescheduleTimer();
+  }
+}
+
+function rescheduleTimer() {
+  if (timer) clearInterval(timer);
+  if (countdownTimer) clearInterval(countdownTimer);
+  if (!state.apiKey) return;
+  timer = setInterval(refresh, state.nextRefreshSec * 1000);
+  countdownTimer = setInterval(() => {
+    state.countdown = Math.max(0, state.countdown - 1);
+    const el = document.getElementById("countdown");
+    if (el) el.textContent = state.countdown + "s";
+  }, 1000);
+}
+
+function startTimer() {
+  if (timer) clearInterval(timer);
+  if (countdownTimer) clearInterval(countdownTimer);
+  if (!state.apiKey) return;
+  state.nextRefreshSec = computeAdaptiveDelay();
+  refresh();
+}
+
+// Détection visibilité onglet (recalcule l'adaptive)
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (state.apiKey && state.tab === "scanner") {
+      state.nextRefreshSec = computeAdaptiveDelay();
+      rescheduleTimer();
+    }
+  });
+}
+
+/* ====== INIT ====== */
+render();
+if (state.apiKey && state.tab === "scanner") startTimer();
+</script>
+</body>
+</html>
