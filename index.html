@@ -503,6 +503,63 @@ function calculateStakes(odds, total=100) {
   return { stakes, profit, roi };
 }
 
+/* ====== ANALYSEUR DE SÉLECTION — Niveau 1.5 ======
+   Calcule une "probabilité théorique de réussite" honnête à partir des
+   data déjà fetchées (pas besoin d'api-sports). Méthode :
+    1. Probabilité implicite par book = 1 / cote
+    2. Probabilité moyenne (consensus brut, contient la marge bookmaker)
+    3. Marge totale du marché = somme des probas - 1
+    4. Probabilité fair (dévigorisée) = ce que le marché "pense" vraiment
+    5. Edge = ta cote vs cote fair
+
+   Limite assumée : ce n'est PAS une prédiction d'IA. C'est le consensus
+   du marché. Pour aller au-delà, il faut Niveau 2 (api-sports).
+*/
+function analyzeOutcome(opp, outcomeName) {
+  const myOdd = opp.best_odds[outcomeName];
+  const fair  = opp.fair_odds?.[outcomeName];
+  if (!myOdd || !fair) return null;
+
+  const myImpliedProba   = 100 / myOdd;
+  const fairProba        = 100 / fair;
+  const edgePts          = myImpliedProba - fairProba; // > 0 = ta cote sous-estime la proba = value
+  // Marge bookmaker du marché entier
+  const allFair = Object.values(opp.fair_odds || {});
+  const allImplied = Object.values(opp.best_odds).map(o => 100/o);
+  const marketMargin = allImplied.reduce((s,p) => s + p, 0) - 100;
+
+  // Verdict honnête
+  let verdict, verdictColor;
+  if (edgePts >= 3) {
+    verdict = "✅ Value bet significatif — la cote est meilleure que ce que le marché pense";
+    verdictColor = "text-cyan-300";
+  } else if (edgePts >= 1) {
+    verdict = "👍 Légère value — edge modéré mais réel";
+    verdictColor = "text-emerald-400";
+  } else if (edgePts >= -1) {
+    verdict = "➖ Pari neutre — cote alignée avec le consensus marché";
+    verdictColor = "text-slate-400";
+  } else if (edgePts >= -3) {
+    verdict = "⚠️ Légèrement défavorable — la cote sous-estime la proba réelle";
+    verdictColor = "text-amber-400";
+  } else {
+    verdict = "❌ Mauvais edge — le marché juge cette cote trop élevée";
+    verdictColor = "text-red-400";
+  }
+
+  return {
+    outcomeName,
+    myOdd,
+    myImpliedProba: r2(myImpliedProba),
+    fairOdd: fair,
+    fairProba: r2(fairProba),
+    edgePts: r2(edgePts),
+    marketMargin: r2(marketMargin),
+    verdict,
+    verdictColor,
+  };
+}
+
 /* ====== TOP PICKS — Niveau 1 ======
    Filtre intelligent automatique des meilleures opportunités du jour.
    Basé sur des critères objectifs (PAS de prédiction d'IA) :
@@ -1352,6 +1409,68 @@ function renderTopPickCard(opp) {
   `;
 }
 
+/**
+ * Panneau d'analyse statistique d'une carte (Niveau 1.5).
+ * Pour chaque outcome : proba implicite ta cote, proba fair, edge, verdict.
+ * Pas de prédiction d'IA — juste de la math sur les data marché.
+ */
+function renderAnalysisPanel(opp) {
+  const analyses = Object.keys(opp.best_odds).map(k => analyzeOutcome(opp, k)).filter(Boolean);
+  if (!analyses.length) return "";
+  const margin = analyses[0].marketMargin;
+  return `
+    <details class="mt-3 pt-3 border-t border-slate-800">
+      <summary class="text-xs text-cyan-400 hover:text-cyan-300 cursor-pointer flex items-center gap-2">
+        <span>📊 Analyse statistique de la sélection</span>
+        <span class="text-slate-600">(probabilité théorique — clique pour ouvrir)</span>
+      </summary>
+      <div class="mt-3 bg-slate-950 rounded p-3 text-xs space-y-3">
+        <div class="text-slate-400 italic text-[11px]">
+          Méthode : on calcule la probabilité fair (ce que le marché pense vraiment, après retrait de la marge bookmaker de ${margin}%) et on la compare à ta cote. Pas de prédiction d'IA, juste de la math sur les data marché.
+        </div>
+        ${analyses.map(a => `
+          <div class="border-t border-slate-800 pt-2 first:border-0 first:pt-0">
+            <div class="flex justify-between items-center mb-2 flex-wrap gap-2">
+              <strong class="text-slate-200">${escapeHtml(a.outcomeName)}</strong>
+              <div class="flex gap-3 text-slate-400">
+                <span>cote <strong class="text-white">${a.myOdd}</strong></span>
+                <span>→ implique <strong class="text-white">${a.myImpliedProba}%</strong></span>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+              <div class="bg-slate-900 rounded p-2">
+                <div class="text-[10px] text-slate-500">Cote fair (dévigorisée)</div>
+                <div class="font-mono text-sm">${a.fairOdd}</div>
+              </div>
+              <div class="bg-slate-900 rounded p-2">
+                <div class="text-[10px] text-slate-500">🎯 Proba théorique</div>
+                <div class="font-mono text-sm text-emerald-300">${a.fairProba}%</div>
+              </div>
+              <div class="bg-slate-900 rounded p-2">
+                <div class="text-[10px] text-slate-500">Edge (proba implicite − fair)</div>
+                <div class="font-mono text-sm ${a.edgePts>=1?'text-cyan-300':a.edgePts<=-1?'text-amber-400':'text-slate-400'}">
+                  ${a.edgePts>=0?'+':''}${a.edgePts} pts
+                </div>
+              </div>
+              <div class="bg-slate-900 rounded p-2">
+                <div class="text-[10px] text-slate-500">Espérance / 100€</div>
+                <div class="font-mono text-sm ${a.edgePts>=1?'text-emerald-400':a.edgePts<=-1?'text-red-400':'text-slate-400'}">
+                  ${(a.edgePts >= 0 ? '+' : '')}${(100 * (a.fairProba/100 * a.myOdd - 1)).toFixed(2)} €
+                </div>
+              </div>
+            </div>
+            <div class="${a.verdictColor} text-xs">${a.verdict}</div>
+          </div>
+        `).join("")}
+        <div class="text-[11px] text-slate-500 italic mt-2 pt-2 border-t border-slate-800">
+          ⚠ "Probabilité théorique" = consensus du marché après retrait de la marge bookmaker. C'est l'estimation collective des bookies, pas une prédiction d'IA.
+          Pour une vraie analyse contextuelle (forme équipes, blessures, H2H), il faudra le Niveau 2 avec api-sports.io (à venir).
+        </div>
+      </div>
+    </details>
+  `;
+}
+
 function renderCard(opp, kind) {
   const {stakes, profit, roi} = calculateStakes(opp.best_odds, state.stake);
   const isFresh = state.flashIds.has(opp.id);
@@ -1452,6 +1571,8 @@ function renderCard(opp, kind) {
              </span>`}
         <button data-hide="${opp.id}" class="hide-btn text-xs text-slate-500 hover:text-red-400">✕ masquer</button>
       </div>
+
+      ${renderAnalysisPanel(opp)}
     </div>
   `;
 }
