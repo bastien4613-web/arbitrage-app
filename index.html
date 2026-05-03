@@ -1860,6 +1860,18 @@ function renderCard(opp, kind) {
       </div>
 
       ${renderAnalysisPanel(opp)}
+
+      ${state.apiSportsEnabled && state.apiSportsKey && getApiSportsMapping(opp.sport_key) ? `
+        <div class="mt-3">
+          ${state.statsPanels?.[opp.id]
+            ? renderStatsPanel(opp.id)
+            : `<button class="load-stats text-xs bg-cyan-600/20 hover:bg-cyan-600/40 text-cyan-300 px-3 py-1 rounded"
+                  data-opp-id="${escapeAttr(opp.id)}" data-sport="${escapeAttr(opp.sport_key)}"
+                  data-home="${escapeAttr(opp.home_team)}" data-away="${escapeAttr(opp.away_team)}">
+                  📊 Charger les stats équipes (api-sports)
+                </button>`}
+        </div>
+      ` : ""}
     </div>
   `;
 }
