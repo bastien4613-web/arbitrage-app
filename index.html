@@ -242,6 +242,13 @@ const state = {
   scanWindowMin:    Number(ls("arb_scan_window", 0)),         // ne scanner que jusqu'à X jours (0 = tous)
   pausedUntil:      Number(ls("arb_paused_until", 0)),
 
+  // v3.1 — filtres marché et cote
+  marketFilter:     ls("arb_market_filter", "all"),           // "all" | "h2h" | "totals"
+  minOdds:          Number(ls("arb_min_odds", 1.0)),          // exclure outcomes < X
+  maxOdds:          Number(ls("arb_max_odds", 50.0)),         // exclure outcomes > X (filtre paris spéculatifs)
+  showValueBets:    ls("arb_show_values", true) === true,     // toggle bloc value bets
+  showArbs:         ls("arb_show_arbs", true) === true,       // toggle bloc arbs
+
   // runtime
   data: [],
   valueBets: [],
@@ -450,8 +457,15 @@ async function getTopOpportunities(apiKey) {
       for (const o of opps) {
         if (state.hidden[o.id]) continue;
         if (o.confidence < state.minConfidence) continue;
-        if (o.arb_pct >= MIN_ARB_PCT) arbs.push(o);
-        if (o.max_edge >= state.valueEdge) values.push(o);
+        // Filtre marché (h2h / totals / all)
+        if (state.marketFilter !== "all" && o.market !== state.marketFilter) continue;
+        // Filtre tranche de cote : toutes les jambes doivent être dans [minOdds, maxOdds]
+        const oddsValues = Object.values(o.best_odds);
+        const minO = Math.min(...oddsValues);
+        const maxO = Math.max(...oddsValues);
+        if (minO < state.minOdds || maxO > state.maxOdds) continue;
+        if (state.showArbs       && o.arb_pct  >= MIN_ARB_PCT)  arbs.push(o);
+        if (state.showValueBets  && o.max_edge >= state.valueEdge) values.push(o);
       }
     }
   }
@@ -1021,6 +1035,52 @@ function renderScannerTab(enabledCount) {
         </button>
         <button id="exportJson" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded text-sm ml-auto" ${!state.data.length?"disabled":""}>⤓ JSON</button>
         <button id="exportCsv" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded text-sm" ${!state.history.length?"disabled":""}>⤓ CSV</button>
+      </div>
+
+      <!-- v3.1 — FILTRES MARCHÉ + COTE + TOGGLES -->
+      <div class="mt-3 pt-3 border-t border-slate-800 flex gap-3 flex-wrap items-center text-xs">
+        <span class="text-slate-400 font-semibold">Filtres :</span>
+
+        <label class="flex items-center gap-2">
+          <span class="text-slate-400">Marché</span>
+          <select id="marketFilter" class="bg-slate-800 border border-slate-700 rounded px-2 py-1">
+            <option value="all"    ${state.marketFilter==="all"   ?"selected":""}>Tout</option>
+            <option value="h2h"    ${state.marketFilter==="h2h"   ?"selected":""}>1N2 / Vainqueur</option>
+            <option value="totals" ${state.marketFilter==="totals"?"selected":""}>Over/Under</option>
+          </select>
+        </label>
+
+        <label class="flex items-center gap-2" title="Exclut les outcomes avec cote inférieure à ce seuil. Ex: 1.5 vire les outsiders surcotés à 1.10">
+          <span class="text-slate-400">Cote min</span>
+          <input id="minOdds" type="number" step="0.05" min="1" max="50" value="${state.minOdds}" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1" />
+        </label>
+
+        <label class="flex items-center gap-2" title="Exclut les outcomes avec cote supérieure à ce seuil. Ex: 3.0 ne montre que les paris équilibrés">
+          <span class="text-slate-400">Cote max</span>
+          <input id="maxOdds" type="number" step="0.5" min="1" max="100" value="${state.maxOdds}" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1" />
+        </label>
+
+        <span class="text-slate-600">|</span>
+
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="showArbs" type="checkbox" ${state.showArbs?"checked":""} />
+          <span class="text-emerald-400">🎯 Arbitrages</span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="showValueBets" type="checkbox" ${state.showValueBets?"checked":""} />
+          <span class="text-cyan-400">💎 Value bets</span>
+        </label>
+
+        <button id="resetFilters" class="text-slate-500 hover:text-slate-300 ml-auto">↺ reset filtres</button>
+
+        <!-- Presets rapides -->
+        <div class="basis-full flex gap-2 mt-1 flex-wrap">
+          <span class="text-slate-500">Presets :</span>
+          <button class="preset-btn text-emerald-400 hover:underline" data-preset="safe">Cotes sûres (1.4–2.5)</button>
+          <button class="preset-btn text-cyan-400 hover:underline"    data-preset="balanced">Équilibrées (1.7–3.0)</button>
+          <button class="preset-btn text-amber-400 hover:underline"   data-preset="ou">Que de l'Over/Under</button>
+          <button class="preset-btn text-purple-400 hover:underline"  data-preset="all">Tout afficher</button>
+        </div>
       </div>
     </section>
 
@@ -1737,6 +1797,35 @@ function attachScannerListeners() {
 
   $("exportJson")?.addEventListener("click", exportJSON);
   $("exportCsv")?.addEventListener("click", exportCSV);
+
+  // v3.1 — Filtres marché et cote
+  $("marketFilter")?.addEventListener("change", e => { state.marketFilter = e.target.value; save("arb_market_filter", state.marketFilter); refresh(); });
+  $("minOdds")?.addEventListener("change", e => { state.minOdds = Number(e.target.value)||1; save("arb_min_odds", state.minOdds); refresh(); });
+  $("maxOdds")?.addEventListener("change", e => { state.maxOdds = Number(e.target.value)||50; save("arb_max_odds", state.maxOdds); refresh(); });
+  $("showArbs")?.addEventListener("change", e => { state.showArbs = e.target.checked; save("arb_show_arbs", state.showArbs); refresh(); });
+  $("showValueBets")?.addEventListener("change", e => { state.showValueBets = e.target.checked; save("arb_show_values", state.showValueBets); refresh(); });
+  $("resetFilters")?.addEventListener("click", () => {
+    state.marketFilter = "all"; state.minOdds = 1.0; state.maxOdds = 50.0;
+    state.showArbs = true; state.showValueBets = true;
+    save("arb_market_filter", "all"); save("arb_min_odds", 1.0); save("arb_max_odds", 50.0);
+    save("arb_show_arbs", true); save("arb_show_values", true);
+    refresh();
+  });
+
+  // Presets de filtres
+  document.querySelectorAll(".preset-btn").forEach(b => b.addEventListener("click", () => {
+    const p = b.dataset.preset;
+    if (p === "safe")     { state.minOdds = 1.4; state.maxOdds = 2.5; state.marketFilter = "all"; state.showArbs = true; state.showValueBets = true; }
+    if (p === "balanced") { state.minOdds = 1.7; state.maxOdds = 3.0; state.marketFilter = "all"; state.showArbs = true; state.showValueBets = true; }
+    if (p === "ou")       { state.minOdds = 1.0; state.maxOdds = 50.0; state.marketFilter = "totals"; state.showArbs = true; state.showValueBets = true; }
+    if (p === "all")      { state.minOdds = 1.0; state.maxOdds = 50.0; state.marketFilter = "all"; state.showArbs = true; state.showValueBets = true; }
+    save("arb_market_filter", state.marketFilter);
+    save("arb_min_odds", state.minOdds);
+    save("arb_max_odds", state.maxOdds);
+    save("arb_show_arbs", state.showArbs);
+    save("arb_show_values", state.showValueBets);
+    refresh();
+  }));
 
   document.querySelectorAll(".hide-btn").forEach(b => b.addEventListener("click", () => {
     state.hidden[b.dataset.hide] = true; save("arb_hidden", state.hidden); refresh();
