@@ -249,6 +249,15 @@ const state = {
   showValueBets:    ls("arb_show_values", true) === true,     // toggle bloc value bets
   showArbs:         ls("arb_show_arbs", true) === true,       // toggle bloc arbs
 
+  // v3.5 — Onglet "Paris du jour" : affichage neutre des matchs du jour
+  pdjSportFilter:    ls("arb_pdj_sport", "all"),       // "all" ou clé sport
+  pdjHideOdds:       ls("arb_pdj_hide", false) === true,
+  pdjRefreshMin:     Number(ls("arb_pdj_refresh", 10)),// auto-refresh en minutes
+  pdjLastFetch:      0,
+  pdjLoading:        false,
+  pdjError:          null,
+  pdjEvents:         [],
+
   // v3.4 — Niveau 2 : api-sports.io intégration (stats équipes réelles)
   apiSportsKey:        ls("arb_apisports_key", ""),
   apiSportsEnabled:    ls("arb_apisports_on", false) === true,
@@ -1291,6 +1300,7 @@ function render() {
       ${renderHeader()}
       ${renderTabs()}
       ${state.tab === "scanner" ? renderScannerTab(enabledCount) : ""}
+      ${state.tab === "paris"   ? renderParisDuJourTab() : ""}
       ${state.tab === "tracker" ? renderTrackerTab() : ""}
       ${state.tab === "stats"   ? renderStatsTab()   : ""}
       ${state.tab === "settings"? renderSettingsTab(): ""}
@@ -1341,6 +1351,7 @@ function renderTabs() {
   return `
     <nav class="flex border-b border-slate-800 mb-4 gap-1 overflow-x-auto">
       ${tab("scanner","🔍 Scanner")}
+      ${tab("paris","📅 Paris du jour")}
       ${tab("tracker","📊 Tracker")}
       ${tab("stats","📈 Stats")}
       ${tab("settings","⚙️ Réglages")}
@@ -1926,6 +1937,252 @@ function renderCard(opp, kind) {
   `;
 }
 
+/* ====== PARIS DU JOUR TAB (v3.5) ======
+   Affichage neutre : matchs du jour, cotes brutes (moyenne marché), pas
+   d'analyse, pas de couleur signalétique, pas de tri par rentabilité.
+   Le but : se forcer à faire sa propre analyse avant de regarder les cotes.
+*/
+
+// Renvoie [start, end] timestamps couvrant aujourd'hui en local
+function todayBounds() {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0).getTime();
+  const end   = start + 24*3600*1000;
+  return [start, end];
+}
+
+// Récupère les matchs du jour à partir des sports activés.
+// Réutilise fetchOddsCached → 0 quota supplémentaire si le scanner a déjà fetché.
+async function fetchParisDuJour() {
+  if (!state.apiKey) { state.pdjError = "Clé The Odds API manquante (onglet Scanner)."; return; }
+  if (state.pdjLoading) return;
+  state.pdjLoading = true;
+  state.pdjError = null;
+  render();
+  const enabled = SPORTS.filter(s => state.enabled[s.key]);
+  if (!enabled.length) {
+    state.pdjError = "Aucun sport activé. Active des sports dans l'onglet Scanner.";
+    state.pdjLoading = false;
+    render();
+    return;
+  }
+  const [dayStart, dayEnd] = todayBounds();
+  const all = [];
+  const errors = [];
+  await Promise.all(enabled.map(async sport => {
+    try {
+      const { events } = await fetchOddsCached(sport.key, state.apiKey);
+      for (const ev of events) {
+        const t = new Date(ev.commence_time).getTime();
+        if (t < dayStart || t >= dayEnd) continue;
+        const odds = extractH2HAverageOdds(ev);
+        if (!odds) continue;
+        all.push({
+          id: ev.id,
+          sport_key: sport.key,
+          sport_label: sport.label,
+          sport_emoji: sport.emoji,
+          home: ev.home_team || (ev.teams?.[0]) || "Équipe A",
+          away: ev.away_team || (ev.teams?.[1]) || "Équipe B",
+          start_time: ev.commence_time,
+          start_ts: t,
+          odds, // { outcomeName: averageOdd }
+          book_count: ev.bookmakers?.length || 0,
+        });
+      }
+    } catch (e) {
+      const msg = String(e?.message || e);
+      // 422 / sport hors-saison → ignoré silencieusement
+      if (!/422|UNKNOWN_SPORT|Sport not found/i.test(msg)) errors.push(`${sport.label}: ${msg}`);
+    }
+  }));
+  // Tri par heure de début (croissant)
+  all.sort((a,b) => a.start_ts - b.start_ts);
+  state.pdjEvents = all;
+  state.pdjLastFetch = Date.now();
+  state.pdjLoading = false;
+  if (errors.length) state.pdjError = `${errors.length} erreur(s) : ${errors.slice(0,2).join(" | ")}`;
+  render();
+}
+
+// Calcule la cote moyenne par outcome sur le marché h2h (1X2 ou 2-way).
+// Moyenne plutôt que "best" pour rester neutre (pas de notion "meilleur book").
+function extractH2HAverageOdds(event) {
+  const accum = {};
+  let bookCount = 0;
+  for (const b of (event.bookmakers || [])) {
+    const m = b.markets?.find(x => x.key === "h2h");
+    if (!m) continue;
+    bookCount++;
+    for (const o of m.outcomes) {
+      (accum[o.name] = accum[o.name] || []).push(o.price);
+    }
+  }
+  if (!bookCount) return null;
+  const out = {};
+  for (const [name, arr] of Object.entries(accum)) {
+    out[name] = r2(arr.reduce((a,b)=>a+b,0) / arr.length);
+  }
+  return out;
+}
+
+function renderParisDuJourTab() {
+  // Sports avec au moins 1 match aujourd'hui (pour le filtre)
+  const sportsWithEvents = [...new Set(state.pdjEvents.map(e => e.sport_key))]
+    .map(k => SPORTS.find(s => s.key === k))
+    .filter(Boolean);
+
+  const filtered = state.pdjSportFilter === "all"
+    ? state.pdjEvents
+    : state.pdjEvents.filter(e => e.sport_key === state.pdjSportFilter);
+
+  const lastFetchStr = state.pdjLastFetch
+    ? new Date(state.pdjLastFetch).toLocaleTimeString("fr-FR")
+    : "—";
+
+  return `
+    <!-- BARRE COMMANDES -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+        <div class="md:col-span-4">
+          <label class="block text-xs text-slate-400 mb-1">Filtrer par sport</label>
+          <select id="pdjSportFilter" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+            <option value="all" ${state.pdjSportFilter==="all"?"selected":""}>Tous (${state.pdjEvents.length} matchs)</option>
+            ${sportsWithEvents.map(s => {
+              const count = state.pdjEvents.filter(e => e.sport_key === s.key).length;
+              return `<option value="${escapeAttr(s.key)}" ${state.pdjSportFilter===s.key?"selected":""}>${s.emoji||""} ${escapeHtml(s.label)} (${count})</option>`;
+            }).join("")}
+          </select>
+        </div>
+        <div class="md:col-span-3">
+          <label class="block text-xs text-slate-400 mb-1">Auto-refresh (min, 0 = off)</label>
+          <input id="pdjRefreshMin" type="number" min="0" max="120" step="1" value="${state.pdjRefreshMin}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm" />
+        </div>
+        <div class="md:col-span-3">
+          <label class="flex items-center gap-2 text-sm pt-5">
+            <input id="pdjHideOdds" type="checkbox" ${state.pdjHideOdds?"checked":""} />
+            <span>Masquer les cotes</span>
+          </label>
+        </div>
+        <div class="md:col-span-2">
+          <button id="pdjRefresh" class="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded px-3 py-1.5 text-sm">↻ Rafraîchir</button>
+        </div>
+      </div>
+      <div class="text-[11px] text-slate-500 mt-3 flex flex-wrap gap-3">
+        <span>Dernière maj : ${lastFetchStr}</span>
+        <span>·</span>
+        <span>Source : The Odds API · cache partagé avec le Scanner (0 quota supplémentaire)</span>
+        ${state.pdjEvents.length === 0 && !state.pdjLoading && !state.pdjError ? `<span>· Clique « Rafraîchir » pour charger les matchs du jour.</span>` : ""}
+      </div>
+      ${state.pdjError ? `<div class="mt-2 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded p-2">${escapeHtml(state.pdjError)}</div>` : ""}
+    </section>
+
+    <!-- LISTE DES MATCHS -->
+    ${state.pdjLoading ? `
+      <div class="text-center text-sm text-slate-400 py-8">⟳ Chargement…</div>
+    ` : filtered.length === 0 ? `
+      <div class="text-center text-sm text-slate-500 py-8">Aucun match trouvé pour aujourd'hui avec ce filtre.</div>
+    ` : `
+      <ul class="space-y-2">
+        ${filtered.map(renderParisDuJourRow).join("")}
+      </ul>
+      <p class="text-[10px] text-slate-600 text-center mt-4">
+        ${filtered.length} match${filtered.length>1?"s":""} affiché${filtered.length>1?"s":""} · cotes = moyenne marché (toutes books confondus) · aucune analyse, aucune suggestion
+      </p>
+    `}
+  `;
+}
+
+function renderParisDuJourRow(ev) {
+  const time = new Date(ev.start_time).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  const oddsEntries = Object.entries(ev.odds);
+  // Pour h2h 3-way (1X2) : ordonner Home / Draw / Away. Pour 2-way : Home / Away.
+  const ordered = orderH2HOutcomes(oddsEntries, ev.home, ev.away);
+
+  return `
+    <li class="bg-slate-900 border border-slate-800 rounded px-3 py-2.5 flex items-center gap-3 flex-wrap">
+      <span class="text-xs font-mono text-slate-400 w-12 shrink-0">${time}</span>
+      <span class="text-xs text-slate-500 shrink-0">${ev.sport_emoji||""} ${escapeHtml(ev.sport_label)}</span>
+      <span class="text-sm text-slate-200 flex-1 min-w-0 truncate">
+        ${escapeHtml(ev.home)} <span class="text-slate-500">vs</span> ${escapeHtml(ev.away)}
+      </span>
+      ${state.pdjHideOdds ? `
+        <span class="text-xs text-slate-600 italic shrink-0">cotes masquées</span>
+      ` : `
+        <div class="flex gap-1.5 shrink-0">
+          ${ordered.map(([name, odd]) => `
+            <div class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-center min-w-[60px]">
+              <div class="text-[10px] text-slate-500 truncate max-w-[100px]">${escapeHtml(shortLabel(name, ev.home, ev.away))}</div>
+              <div class="text-sm font-mono text-slate-200">${odd.toFixed(2)}</div>
+            </div>
+          `).join("")}
+        </div>
+      `}
+    </li>
+  `;
+}
+
+// Tri 1/X/2 quand applicable (foot, hockey…), sinon Home/Away (tennis, basket).
+function orderH2HOutcomes(entries, home, away) {
+  const findEq = (name) => entries.find(([n]) => n.toLowerCase() === name.toLowerCase());
+  const homeE = findEq(home);
+  const awayE = findEq(away);
+  const drawE = entries.find(([n]) => /draw|nul|null/i.test(n));
+  const out = [];
+  if (homeE) out.push(homeE);
+  if (drawE) out.push(drawE);
+  if (awayE) out.push(awayE);
+  // Cas inattendu : on retombe sur l'ordre brut
+  if (out.length === entries.length) return out;
+  return entries;
+}
+
+// Raccourci d'affichage : "1", "X", "2" si on reconnaît le pattern, sinon nom court
+function shortLabel(name, home, away) {
+  if (name.toLowerCase() === home.toLowerCase()) return "1";
+  if (name.toLowerCase() === away.toLowerCase()) return "2";
+  if (/draw|nul/i.test(name)) return "X";
+  return name.length > 12 ? name.slice(0, 12) + "…" : name;
+}
+
+let pdjAutoRefreshTimer = null;
+function setupParisDuJourAutoRefresh() {
+  if (pdjAutoRefreshTimer) { clearInterval(pdjAutoRefreshTimer); pdjAutoRefreshTimer = null; }
+  if (state.pdjRefreshMin > 0 && state.tab === "paris") {
+    pdjAutoRefreshTimer = setInterval(() => {
+      if (state.tab === "paris" && !state.pdjLoading) fetchParisDuJour();
+    }, state.pdjRefreshMin * 60 * 1000);
+  }
+}
+
+function attachParisDuJourListeners() {
+  const $ = id => document.getElementById(id);
+  $("pdjSportFilter")?.addEventListener("change", e => {
+    state.pdjSportFilter = e.target.value;
+    save("arb_pdj_sport", state.pdjSportFilter);
+    render();
+  });
+  $("pdjHideOdds")?.addEventListener("change", e => {
+    state.pdjHideOdds = e.target.checked;
+    save("arb_pdj_hide", state.pdjHideOdds);
+    render();
+  });
+  $("pdjRefreshMin")?.addEventListener("change", e => {
+    const v = Math.max(0, Math.min(120, Number(e.target.value) || 0));
+    state.pdjRefreshMin = v;
+    save("arb_pdj_refresh", v);
+    setupParisDuJourAutoRefresh();
+  });
+  $("pdjRefresh")?.addEventListener("click", () => fetchParisDuJour());
+
+  // Charge automatiquement au premier passage sur l'onglet (si vide ou cache > 5min)
+  const stale = !state.pdjLastFetch || (Date.now() - state.pdjLastFetch > 5*60*1000);
+  if (state.apiKey && stale && !state.pdjLoading && state.pdjEvents.length === 0) {
+    fetchParisDuJour();
+  }
+  setupParisDuJourAutoRefresh();
+}
+
 /* ====== TRACKER TAB ====== */
 function renderTrackerTab() {
   const pending = state.bets.filter(b => b.status === "pending");
@@ -2395,6 +2652,7 @@ function attachListeners() {
   });
 
   if (state.tab === "scanner")  attachScannerListeners();
+  if (state.tab === "paris")    attachParisDuJourListeners();
   if (state.tab === "tracker")  attachTrackerListeners();
   if (state.tab === "settings") attachSettingsListeners();
 }
