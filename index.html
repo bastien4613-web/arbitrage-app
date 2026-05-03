@@ -253,10 +253,12 @@ const state = {
   pdjSportFilter:    ls("arb_pdj_sport", "all"),       // "all" ou clé sport
   pdjHideOdds:       ls("arb_pdj_hide", false) === true,
   pdjRefreshMin:     Number(ls("arb_pdj_refresh", 10)),// auto-refresh en minutes
+  pdjWindow:         ls("arb_pdj_window", "next24h"),  // "today" (calendrier) | "next24h" (glissant) | "next48h"
   pdjLastFetch:      0,
   pdjLoading:        false,
   pdjError:          null,
   pdjEvents:         [],
+  pdjTotalFetched:   0,        // total events fetchés avant filtre fenêtre — pour diagnostic
 
   // v3.4 — Niveau 2 : api-sports.io intégration (stats équipes réelles)
   apiSportsKey:        ls("arb_apisports_key", ""),
@@ -1943,12 +1945,19 @@ function renderCard(opp, kind) {
    Le but : se forcer à faire sa propre analyse avant de regarder les cotes.
 */
 
-// Renvoie [start, end] timestamps couvrant aujourd'hui en local
-function todayBounds() {
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0).getTime();
-  const end   = start + 24*3600*1000;
-  return [start, end];
+// Renvoie [start, end] selon state.pdjWindow.
+// - "today"    : minuit local → minuit local +1 (calendrier)
+// - "next24h"  : maintenant → +24h (glissant, utile en soirée)
+// - "next48h"  : maintenant → +48h (week-end / pré-vue)
+function pdjBounds() {
+  const now = Date.now();
+  if (state.pdjWindow === "today") {
+    const d = new Date();
+    const start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0).getTime();
+    return [start, start + 24*3600*1000];
+  }
+  if (state.pdjWindow === "next48h") return [now, now + 48*3600*1000];
+  return [now, now + 24*3600*1000]; // next24h par défaut
 }
 
 // Récupère les matchs du jour à partir des sports activés.
@@ -1966,12 +1975,14 @@ async function fetchParisDuJour() {
     render();
     return;
   }
-  const [dayStart, dayEnd] = todayBounds();
+  const [dayStart, dayEnd] = pdjBounds();
   const all = [];
   const errors = [];
+  let totalFetched = 0;
   await Promise.all(enabled.map(async sport => {
     try {
       const { events } = await fetchOddsCached(sport.key, state.apiKey);
+      totalFetched += events.length;
       for (const ev of events) {
         const t = new Date(ev.commence_time).getTime();
         if (t < dayStart || t >= dayEnd) continue;
@@ -1999,6 +2010,7 @@ async function fetchParisDuJour() {
   // Tri par heure de début (croissant)
   all.sort((a,b) => a.start_ts - b.start_ts);
   state.pdjEvents = all;
+  state.pdjTotalFetched = totalFetched;
   state.pdjLastFetch = Date.now();
   state.pdjLoading = false;
   if (errors.length) state.pdjError = `${errors.length} erreur(s) : ${errors.slice(0,2).join(" | ")}`;
@@ -2040,11 +2052,21 @@ function renderParisDuJourTab() {
     ? new Date(state.pdjLastFetch).toLocaleTimeString("fr-FR")
     : "—";
 
+  const enabledCount = SPORTS.filter(s => state.enabled[s.key]).length;
+
   return `
     <!-- BARRE COMMANDES -->
     <section class="bg-slate-900 rounded-lg p-4 mb-4">
       <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-        <div class="md:col-span-4">
+        <div class="md:col-span-3">
+          <label class="block text-xs text-slate-400 mb-1">Fenêtre temporelle</label>
+          <select id="pdjWindow" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
+            <option value="today"   ${state.pdjWindow==="today"  ?"selected":""}>Aujourd'hui (calendrier)</option>
+            <option value="next24h" ${state.pdjWindow==="next24h"?"selected":""}>Prochaines 24h</option>
+            <option value="next48h" ${state.pdjWindow==="next48h"?"selected":""}>Prochaines 48h</option>
+          </select>
+        </div>
+        <div class="md:col-span-3">
           <label class="block text-xs text-slate-400 mb-1">Filtrer par sport</label>
           <select id="pdjSportFilter" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
             <option value="all" ${state.pdjSportFilter==="all"?"selected":""}>Tous (${state.pdjEvents.length} matchs)</option>
@@ -2054,14 +2076,14 @@ function renderParisDuJourTab() {
             }).join("")}
           </select>
         </div>
-        <div class="md:col-span-3">
-          <label class="block text-xs text-slate-400 mb-1">Auto-refresh (min, 0 = off)</label>
+        <div class="md:col-span-2">
+          <label class="block text-xs text-slate-400 mb-1">Auto-refresh (min)</label>
           <input id="pdjRefreshMin" type="number" min="0" max="120" step="1" value="${state.pdjRefreshMin}" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm" />
         </div>
-        <div class="md:col-span-3">
+        <div class="md:col-span-2">
           <label class="flex items-center gap-2 text-sm pt-5">
             <input id="pdjHideOdds" type="checkbox" ${state.pdjHideOdds?"checked":""} />
-            <span>Masquer les cotes</span>
+            <span>Masquer cotes</span>
           </label>
         </div>
         <div class="md:col-span-2">
@@ -2071,8 +2093,11 @@ function renderParisDuJourTab() {
       <div class="text-[11px] text-slate-500 mt-3 flex flex-wrap gap-3">
         <span>Dernière maj : ${lastFetchStr}</span>
         <span>·</span>
+        <span>Sports activés : ${enabledCount}</span>
+        <span>·</span>
+        <span>Total events : ${state.pdjTotalFetched}</span>
+        <span>·</span>
         <span>Source : The Odds API · cache partagé avec le Scanner (0 quota supplémentaire)</span>
-        ${state.pdjEvents.length === 0 && !state.pdjLoading && !state.pdjError ? `<span>· Clique « Rafraîchir » pour charger les matchs du jour.</span>` : ""}
       </div>
       ${state.pdjError ? `<div class="mt-2 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded p-2">${escapeHtml(state.pdjError)}</div>` : ""}
     </section>
@@ -2081,7 +2106,16 @@ function renderParisDuJourTab() {
     ${state.pdjLoading ? `
       <div class="text-center text-sm text-slate-400 py-8">⟳ Chargement…</div>
     ` : filtered.length === 0 ? `
-      <div class="text-center text-sm text-slate-500 py-8">Aucun match trouvé pour aujourd'hui avec ce filtre.</div>
+      <div class="bg-slate-900 rounded-lg p-6 text-center text-sm text-slate-400 space-y-3">
+        <div>Aucun match trouvé dans la fenêtre <strong>${state.pdjWindow === "today" ? "calendrier d'aujourd'hui" : state.pdjWindow === "next24h" ? "des prochaines 24h" : "des prochaines 48h"}</strong>.</div>
+        <div class="text-xs text-slate-500 space-y-1">
+          ${enabledCount === 0
+            ? `<div>⚠ Aucun sport activé — va dans l'onglet <strong>Scanner</strong> pour activer des sports.</div>`
+            : state.pdjTotalFetched === 0
+              ? `<div>⚠ ${enabledCount} sport(s) activé(s) mais aucun event renvoyé par l'API. Possible : tous hors-saison, ou clé API expirée. Vérifie l'onglet Scanner.</div>`
+              : `<div>${state.pdjTotalFetched} events trouvés au total mais aucun ne tombe dans la fenêtre. Essaie <strong>"Prochaines 48h"</strong> ci-dessus.</div>`}
+        </div>
+      </div>
     ` : `
       <ul class="space-y-2">
         ${filtered.map(renderParisDuJourRow).join("")}
@@ -2157,6 +2191,11 @@ function setupParisDuJourAutoRefresh() {
 
 function attachParisDuJourListeners() {
   const $ = id => document.getElementById(id);
+  $("pdjWindow")?.addEventListener("change", e => {
+    state.pdjWindow = e.target.value;
+    save("arb_pdj_window", state.pdjWindow);
+    fetchParisDuJour(); // re-filtre instantané (réutilise cache → 0 quota)
+  });
   $("pdjSportFilter")?.addEventListener("change", e => {
     state.pdjSportFilter = e.target.value;
     save("arb_pdj_sport", state.pdjSportFilter);
