@@ -249,10 +249,19 @@ const state = {
   showValueBets:    ls("arb_show_values", true) === true,     // toggle bloc value bets
   showArbs:         ls("arb_show_arbs", true) === true,       // toggle bloc arbs
 
+  // v3.4 — Niveau 2 : api-sports.io intégration (stats équipes réelles)
+  apiSportsKey:        ls("arb_apisports_key", ""),
+  apiSportsEnabled:    ls("arb_apisports_on", false) === true,
+  apiSportsQuotaUsed:  Number(ls("arb_apisports_quota", 0)),  // compte journalier local
+  apiSportsQuotaDate:  ls("arb_apisports_qdate", ""),         // date du compteur (reset à minuit)
+  apiSportsTeamCache:  ls("arb_apisports_teams", {}),         // {key: {id, name}} permanent
+  apiSportsStatsCache: ls("arb_apisports_stats", {}),         // {key: {data, ts}} TTL 6h
+
   // runtime
   data: [],
   valueBets: [],
   topPicks: [],
+  statsPanels: {},  // {oppId: {loading, data, error}} - Niveau 2 api-sports
   rawCount: 0,
   quotaRemaining: null,
   quotaUsed: null,
@@ -501,6 +510,213 @@ function calculateStakes(odds, total=100) {
   const profit = r2(stakes[f] * odds[f] - total);
   const roi = r2(profit/total * 100);
   return { stakes, profit, roi };
+}
+
+/* ====== API-SPORTS CLIENT — Niveau 2 ======
+   Récupère stats équipes/forme récente/H2H pour Foot, NBA, NHL.
+   Auth : header `x-apisports-key`. Tous les endpoints partagent la même clé.
+   Cache aggressif : team IDs permanents, stats 6h TTL.
+*/
+
+// Mapping sport_key → { service, league_id, season }
+// Note : api-sports utilise l'année de DÉBUT de saison (2024 = saison 2024-25)
+function getApiSportsMapping(sportKey) {
+  const currentYear = new Date().getFullYear();
+  const month = new Date().getMonth() + 1; // 1-12
+  // Pour les ligues européennes : saison qui démarre en août = currentYear si on est aug+, sinon year-1
+  const euroSeason = month >= 7 ? currentYear : currentYear - 1;
+  const map = {
+    "soccer_france_ligue_one":      { service: "football",   league: 61,  season: euroSeason },
+    "soccer_uefa_champs_league":    { service: "football",   league: 2,   season: euroSeason },
+    "soccer_uefa_europa_league":    { service: "football",   league: 3,   season: euroSeason },
+    "soccer_epl":                   { service: "football",   league: 39,  season: euroSeason },
+    "soccer_spain_la_liga":         { service: "football",   league: 140, season: euroSeason },
+    "soccer_italy_serie_a":         { service: "football",   league: 135, season: euroSeason },
+    "soccer_germany_bundesliga":    { service: "football",   league: 78,  season: euroSeason },
+    "soccer_france_ligue_two":      { service: "football",   league: 62,  season: euroSeason },
+    "soccer_england_efl_champ":     { service: "football",   league: 40,  season: euroSeason },
+    "soccer_portugal_primeira_liga":{ service: "football",   league: 94,  season: euroSeason },
+    "soccer_netherlands_eredivisie":{ service: "football",   league: 88,  season: euroSeason },
+    "soccer_belgium_first_div":     { service: "football",   league: 144, season: euroSeason },
+    "soccer_turkey_super_league":   { service: "football",   league: 203, season: euroSeason },
+    // Basketball
+    "basketball_nba":               { service: "basketball", league: 12,  season: `${euroSeason}-${euroSeason+1}` },
+    "basketball_euroleague":        { service: "basketball", league: 120, season: `${euroSeason}-${euroSeason+1}` },
+    // Hockey (NHL : démarre en oct)
+    "icehockey_nhl":                { service: "hockey",     league: 57,  season: euroSeason },
+  };
+  return map[sportKey] || null;
+}
+
+const API_SPORTS_BASE = {
+  football:   "https://v3.football.api-sports.io",
+  basketball: "https://v1.basketball.api-sports.io",
+  hockey:     "https://v1.hockey.api-sports.io",
+};
+
+function apiSportsResetQuotaIfNewDay() {
+  const today = todayISO();
+  if (state.apiSportsQuotaDate !== today) {
+    state.apiSportsQuotaUsed = 0;
+    state.apiSportsQuotaDate = today;
+    save("arb_apisports_quota", 0);
+    save("arb_apisports_qdate", today);
+  }
+}
+
+async function apiSportsFetch(service, endpoint, params = {}) {
+  apiSportsResetQuotaIfNewDay();
+  if (!state.apiSportsKey) throw new Error("Clé api-sports manquante (Réglages)");
+  if (state.apiSportsQuotaUsed >= 100) throw new Error("Quota api-sports atteint (100/jour)");
+  const url = new URL(API_SPORTS_BASE[service] + endpoint);
+  for (const [k,v] of Object.entries(params)) url.searchParams.set(k, v);
+  const r = await fetch(url, { headers: { "x-apisports-key": state.apiSportsKey } });
+  if (!r.ok) throw new Error(`api-sports ${endpoint} HTTP ${r.status}`);
+  const data = await r.json();
+  // Compteur quota local (api-sports ne renvoie pas de header standard)
+  state.apiSportsQuotaUsed++;
+  save("arb_apisports_quota", state.apiSportsQuotaUsed);
+  if (data.errors && (Array.isArray(data.errors) ? data.errors.length : Object.keys(data.errors).length)) {
+    const errStr = JSON.stringify(data.errors);
+    if (errStr.toLowerCase().includes("token") || errStr.toLowerCase().includes("invalid")) {
+      throw new Error("Clé api-sports invalide ou inactive");
+    }
+  }
+  return data.response || [];
+}
+
+// Cherche l'ID d'une équipe (avec cache permanent)
+async function findTeamId(sport_key, teamName) {
+  const cacheKey = `${sport_key}:${teamName.toLowerCase()}`;
+  if (state.apiSportsTeamCache[cacheKey]) return state.apiSportsTeamCache[cacheKey];
+  const mapping = getApiSportsMapping(sport_key);
+  if (!mapping) throw new Error(`Sport ${sport_key} non supporté par api-sports`);
+  // Pour le foot, on filtre par league pour précision. Pour basket/hockey, search seul.
+  const params = mapping.service === "football"
+    ? { search: teamName, league: mapping.league, season: mapping.season }
+    : { search: teamName };
+  const teams = await apiSportsFetch(mapping.service, "/teams", params);
+  if (!teams.length) {
+    // Fallback : essai sans la league
+    const teams2 = await apiSportsFetch(mapping.service, "/teams", { search: teamName });
+    if (!teams2.length) throw new Error(`Équipe "${teamName}" introuvable`);
+    teams.push(...teams2);
+  }
+  const team = teams[0]; // on prend le premier match (api-sports retourne par pertinence)
+  const id = team.team?.id || team.id;
+  const name = team.team?.name || team.name;
+  const result = { id, name };
+  state.apiSportsTeamCache[cacheKey] = result;
+  save("arb_apisports_teams", state.apiSportsTeamCache);
+  return result;
+}
+
+// Récupère stats analysées pour un match (avec cache 6h)
+async function getMatchStats(sport_key, homeTeam, awayTeam) {
+  const cacheKey = `${sport_key}:${homeTeam}:${awayTeam}`;
+  const cached = state.apiSportsStatsCache[cacheKey];
+  if (cached && Date.now() - cached.ts < 6*3600*1000) return cached.data;
+
+  const mapping = getApiSportsMapping(sport_key);
+  if (!mapping) throw new Error(`Sport ${sport_key} non supporté`);
+
+  // 1. Trouver les IDs (cached → 0 req)
+  const home = await findTeamId(sport_key, homeTeam);
+  const away = await findTeamId(sport_key, awayTeam);
+
+  // 2. Derniers matchs de chaque équipe + H2H (3 req)
+  let homeRecent, awayRecent, h2h;
+  if (mapping.service === "football") {
+    [homeRecent, awayRecent, h2h] = await Promise.all([
+      apiSportsFetch("football", "/fixtures", { team: home.id, last: 5 }),
+      apiSportsFetch("football", "/fixtures", { team: away.id, last: 5 }),
+      apiSportsFetch("football", "/fixtures/headtohead", { h2h: `${home.id}-${away.id}`, last: 5 }),
+    ]);
+  } else if (mapping.service === "basketball") {
+    [homeRecent, awayRecent, h2h] = await Promise.all([
+      apiSportsFetch("basketball", "/games", { team: home.id, season: mapping.season, league: mapping.league, last: 5 }),
+      apiSportsFetch("basketball", "/games", { team: away.id, season: mapping.season, league: mapping.league, last: 5 }),
+      apiSportsFetch("basketball", "/games/h2h", { h2h: `${home.id}-${away.id}` }),
+    ]);
+  } else if (mapping.service === "hockey") {
+    [homeRecent, awayRecent, h2h] = await Promise.all([
+      apiSportsFetch("hockey", "/games", { team: home.id, season: mapping.season, league: mapping.league, last: 5 }),
+      apiSportsFetch("hockey", "/games", { team: away.id, season: mapping.season, league: mapping.league, last: 5 }),
+      apiSportsFetch("hockey", "/games/h2h", { h2h: `${home.id}-${away.id}` }),
+    ]);
+  }
+
+  // 3. Synthèse
+  const data = {
+    sport: mapping.service,
+    home: { ...home, stats: summarizeRecent(homeRecent, home.id, mapping.service) },
+    away: { ...away, stats: summarizeRecent(awayRecent, away.id, mapping.service) },
+    h2h:  summarizeH2H(h2h?.slice(0,5) || [], home.id, away.id, mapping.service),
+  };
+  state.apiSportsStatsCache[cacheKey] = { data, ts: Date.now() };
+  // Cleanup cache > 24h pour pas exploser localStorage
+  for (const [k,v] of Object.entries(state.apiSportsStatsCache)) {
+    if (Date.now() - v.ts > 24*3600*1000) delete state.apiSportsStatsCache[k];
+  }
+  save("arb_apisports_stats", state.apiSportsStatsCache);
+  return data;
+}
+
+// Résume une liste de matchs récents : W/L/D, pts marqués/encaissés moyens
+function summarizeRecent(games, teamId, service) {
+  if (!games?.length) return { count: 0, wins: 0, losses: 0, draws: 0, avgFor: 0, avgAgainst: 0, results: [] };
+  let wins = 0, losses = 0, draws = 0, totalFor = 0, totalAgainst = 0;
+  const results = [];
+  for (const g of games) {
+    let homeId, awayId, homeScore, awayScore;
+    if (service === "football") {
+      homeId = g.teams?.home?.id; awayId = g.teams?.away?.id;
+      homeScore = g.goals?.home; awayScore = g.goals?.away;
+    } else if (service === "basketball") {
+      homeId = g.teams?.home?.id; awayId = g.teams?.away?.id;
+      homeScore = g.scores?.home?.total; awayScore = g.scores?.away?.total;
+    } else if (service === "hockey") {
+      homeId = g.teams?.home?.id; awayId = g.teams?.away?.id;
+      homeScore = g.scores?.home; awayScore = g.scores?.away;
+    }
+    if (homeScore === null || homeScore === undefined || awayScore === null || awayScore === undefined) continue;
+    const isHome = homeId === teamId;
+    const teamScore = isHome ? homeScore : awayScore;
+    const oppScore  = isHome ? awayScore : homeScore;
+    totalFor += teamScore;
+    totalAgainst += oppScore;
+    if (teamScore > oppScore) { wins++; results.push("W"); }
+    else if (teamScore < oppScore) { losses++; results.push("L"); }
+    else { draws++; results.push("D"); }
+  }
+  const count = wins + losses + draws;
+  return {
+    count, wins, losses, draws,
+    avgFor: count ? r2(totalFor/count) : 0,
+    avgAgainst: count ? r2(totalAgainst/count) : 0,
+    results, // ["W","L","W"...] du plus récent au plus ancien
+  };
+}
+
+function summarizeH2H(games, homeId, awayId, service) {
+  if (!games?.length) return { count: 0, homeWins: 0, awayWins: 0, draws: 0, avgTotal: 0, lastResults: [] };
+  let homeWins = 0, awayWins = 0, draws = 0, totalScore = 0;
+  const lastResults = [];
+  for (const g of games) {
+    let h, a, hs, as;
+    if (service === "football") { h = g.teams?.home?.id; a = g.teams?.away?.id; hs = g.goals?.home; as = g.goals?.away; }
+    else if (service === "basketball") { h = g.teams?.home?.id; a = g.teams?.away?.id; hs = g.scores?.home?.total; as = g.scores?.away?.total; }
+    else { h = g.teams?.home?.id; a = g.teams?.away?.id; hs = g.scores?.home; as = g.scores?.away; }
+    if (hs === null || hs === undefined || as === null || as === undefined) continue;
+    totalScore += (hs + as);
+    let resultStr;
+    if (hs > as) { resultStr = h === homeId ? "Home" : "Away"; if (h === homeId) homeWins++; else awayWins++; }
+    else if (hs < as) { resultStr = a === homeId ? "Home" : "Away"; if (a === homeId) homeWins++; else awayWins++; }
+    else { resultStr = "Nul"; draws++; }
+    lastResults.push(`${hs}-${as}`);
+  }
+  const count = homeWins + awayWins + draws;
+  return { count, homeWins, awayWins, draws, avgTotal: count ? r2(totalScore/count) : 0, lastResults };
 }
 
 /* ====== ANALYSEUR DE SÉLECTION — Niveau 1.5 ======
@@ -1339,6 +1555,65 @@ function renderScannerTab(enabledCount) {
  * Carte compacte pour la section Top Picks. Affichage condensé avec
  * raisons explicites du choix, et boutons Quick Bet directs.
  */
+/**
+ * Rendu du panneau de stats équipes (Niveau 2 - api-sports).
+ * Données déjà chargées et stockées dans state.statsPanels[oppId].
+ */
+function renderStatsPanel(oppId) {
+  const panel = state.statsPanels?.[oppId];
+  if (!panel) return "";
+  if (panel.loading) return `<div class="bg-slate-950 rounded p-3 text-xs text-slate-400">⟳ Chargement des stats équipes…</div>`;
+  if (panel.error)   return `<div class="bg-red-950/40 border border-red-800 rounded p-3 text-xs text-red-300">⚠ ${escapeHtml(panel.error)}</div>`;
+  const d = panel.data;
+  if (!d) return "";
+
+  const renderSquad = (side, t) => `
+    <div class="bg-slate-900 rounded p-3">
+      <div class="font-semibold text-sm mb-2">${side} <span class="text-slate-400 font-normal">${escapeHtml(t.name)}</span></div>
+      <div class="text-xs space-y-1">
+        <div>Forme (5 derniers) : <strong>${t.stats.results.map(r => r==="W"?'<span class="text-emerald-400">W</span>':r==="L"?'<span class="text-red-400">L</span>':'<span class="text-slate-400">N</span>').join(" ")}</strong></div>
+        <div>Bilan : <strong>${t.stats.wins}V</strong> / <strong>${t.stats.draws}N</strong> / <strong>${t.stats.losses}D</strong></div>
+        <div>Marqués/match : <strong class="text-emerald-300">${t.stats.avgFor}</strong> · Encaissés : <strong class="text-amber-300">${t.stats.avgAgainst}</strong></div>
+      </div>
+    </div>
+  `;
+
+  // Pour totals : indication intelligente sur la ligne O/U
+  let ouHint = "";
+  const projTotal = d.home.stats.avgFor + d.away.stats.avgFor;
+  if (projTotal > 0) {
+    ouHint = `
+      <div class="text-xs mt-2 p-2 bg-cyan-900/20 border border-cyan-800/50 rounded">
+        <strong>Indication O/U :</strong> projection brute (moyennes additionnées) ≈ <strong>${r2(projTotal)} pts/buts</strong>
+        <span class="text-slate-500"> — compare à la ligne du bookmaker. Au-dessus = tendance Over, en-dessous = tendance Under. Approximatif, ne tient pas compte des matchs récents face à la défense adverse.</span>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="bg-slate-950 rounded p-3 mt-2 text-xs space-y-3">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        ${renderSquad("🏠", d.home)}
+        ${renderSquad("✈️", d.away)}
+      </div>
+      ${d.h2h.count > 0 ? `
+        <div class="bg-slate-900 rounded p-3">
+          <div class="font-semibold text-sm mb-1">Confrontations directes (${d.h2h.count})</div>
+          <div class="text-xs">
+            ${d.home.name} : <strong>${d.h2h.homeWins}V</strong> · ${d.away.name} : <strong>${d.h2h.awayWins}V</strong> · Nuls : <strong>${d.h2h.draws}</strong>
+            ${d.h2h.lastResults.length ? `<div class="mt-1 text-slate-400">Derniers scores : ${d.h2h.lastResults.join(" · ")}</div>` : ""}
+            ${d.h2h.avgTotal > 0 ? `<div class="mt-1">Total moyen H2H : <strong>${d.h2h.avgTotal}</strong></div>` : ""}
+          </div>
+        </div>
+      ` : `<div class="text-xs text-slate-500 italic">Aucune confrontation directe trouvée dans la période.</div>`}
+      ${ouHint}
+      <div class="text-[10px] text-slate-500 italic pt-2 border-t border-slate-800">
+        Source : api-sports.io · cache 6h · ${state.apiSportsQuotaUsed}/100 req aujourd'hui
+      </div>
+    </div>
+  `;
+}
+
 function renderTopPickCard(opp) {
   const isArb = opp._kind === "arb";
   const {stakes, profit, roi} = calculateStakes(opp.best_odds, state.stake);
@@ -1405,6 +1680,18 @@ function renderTopPickCard(opp) {
           `;
         }).join("")}
       </div>
+
+      ${state.apiSportsEnabled && state.apiSportsKey && getApiSportsMapping(opp.sport_key) ? `
+        <div class="mt-3">
+          ${state.statsPanels?.[opp.id]
+            ? renderStatsPanel(opp.id)
+            : `<button class="load-stats text-xs bg-cyan-600/20 hover:bg-cyan-600/40 text-cyan-300 px-3 py-1 rounded"
+                  data-opp-id="${escapeAttr(opp.id)}" data-sport="${escapeAttr(opp.sport_key)}"
+                  data-home="${escapeAttr(opp.home_team)}" data-away="${escapeAttr(opp.away_team)}">
+                  📊 Charger les stats équipes (api-sports)
+                </button>`}
+        </div>
+      ` : ""}
     </div>
   `;
 }
@@ -1980,6 +2267,37 @@ function renderSettingsTab() {
       </div>
     </section>
 
+    <!-- v3.4 — API-SPORTS (Niveau 2) -->
+    <section class="bg-slate-900 rounded-lg p-4 mb-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">📊 Stats équipes (api-sports.io) — Niveau 2</h2>
+      <div class="text-xs text-slate-400 mb-3">
+        Active l'analyse contextuelle (forme récente, H2H, moyennes) sur les cartes Top Picks.
+        Sports supportés : <strong>Foot (toutes ligues), NBA, NHL</strong>. Tennis non supporté par api-sports.
+        Free tier = 100 req/jour partagés (≈ 8-12 matchs analysés/jour, le reste est en cache 6h).
+      </div>
+      <label class="flex items-center gap-2 text-sm mb-3">
+        <input id="apiSportsEnabled" type="checkbox" ${state.apiSportsEnabled?"checked":""} />
+        <span>Activer api-sports</span>
+      </label>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <label class="md:col-span-2">
+          <span class="text-xs text-slate-400 mb-1 block">Clé api-sports.io (dashboard.api-football.com)</span>
+          <input id="apiSportsKey" type="password" placeholder="abc123..." value="${escapeAttr(state.apiSportsKey)}" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" />
+        </label>
+        <div class="text-sm">
+          <div class="text-xs text-slate-400 mb-1">Quota du jour</div>
+          <div class="bg-slate-800 rounded px-3 py-2 flex items-center justify-between">
+            <span class="font-mono ${state.apiSportsQuotaUsed>=80?'text-red-400':state.apiSportsQuotaUsed>=50?'text-amber-400':'text-emerald-400'}">${state.apiSportsQuotaUsed}/100</span>
+            <button id="apiSportsReset" class="text-xs text-slate-500 hover:text-slate-300">↺ reset compteur local</button>
+          </div>
+        </div>
+      </div>
+      <p class="text-[11px] text-slate-500 mt-2">
+        ⚠ Les stats fournies sont du <strong>contexte pour t'aider à décider</strong>, pas des prédictions garanties.
+        Cache local : team IDs permanents, stats 6h. La même opportunité re-analysée dans la journée = 0 req supplémentaire.
+      </p>
+    </section>
+
     <!-- INFOS -->
     <section class="bg-slate-900 rounded-lg p-4 mb-4 text-xs text-slate-400">
       <h2 class="text-sm font-semibold text-slate-300 mb-2">ℹ Conseils d'utilisation</h2>
@@ -2092,6 +2410,23 @@ function attachScannerListeners() {
     state.hidden[b.dataset.hide] = true; save("arb_hidden", state.hidden); refresh();
   }));
 
+  // v3.4 — Charger les stats api-sports au clic
+  document.querySelectorAll(".load-stats").forEach(b => b.addEventListener("click", async () => {
+    const oppId = b.dataset.oppId;
+    const sport = b.dataset.sport;
+    const home  = b.dataset.home;
+    const away  = b.dataset.away;
+    state.statsPanels[oppId] = { loading: true };
+    render();
+    try {
+      const data = await getMatchStats(sport, home, away);
+      state.statsPanels[oppId] = { data };
+    } catch (e) {
+      state.statsPanels[oppId] = { error: e.message };
+    }
+    render();
+  }));
+
   document.querySelectorAll(".quick-bet").forEach(b => b.addEventListener("click", () => {
     try {
       const data = JSON.parse(b.dataset.opp);
@@ -2151,6 +2486,15 @@ function attachSettingsListeners() {
   boolHandler("adaptiveRefresh", "adaptiveRefresh","arb_adaptive");
   boolHandler("mmEnabled",       "mmEnabled",     "arb_mm_on");
   boolHandler("clvEnabled",      "clvEnabled",    "arb_clv_on");
+  boolHandler("apiSportsEnabled","apiSportsEnabled","arb_apisports_on");
+
+  // api-sports : clé + reset compteur
+  $("apiSportsKey")?.addEventListener("input", e => { state.apiSportsKey = e.target.value.trim(); save("arb_apisports_key", state.apiSportsKey); });
+  $("apiSportsReset")?.addEventListener("click", () => {
+    state.apiSportsQuotaUsed = 0; state.apiSportsQuotaDate = todayISO();
+    save("arb_apisports_quota", 0); save("arb_apisports_qdate", todayISO());
+    render();
+  });
 
   $("ntfy")?.addEventListener("input", e => { state.ntfyTopic = e.target.value.trim(); save("arb_ntfy", state.ntfyTopic); });
   $("desktop")?.addEventListener("change", async e => {
