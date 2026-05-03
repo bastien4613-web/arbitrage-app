@@ -252,6 +252,7 @@ const state = {
   // runtime
   data: [],
   valueBets: [],
+  topPicks: [],
   rawCount: 0,
   quotaRemaining: null,
   quotaUsed: null,
@@ -500,6 +501,51 @@ function calculateStakes(odds, total=100) {
   const profit = r2(stakes[f] * odds[f] - total);
   const roi = r2(profit/total * 100);
   return { stakes, profit, roi };
+}
+
+/* ====== TOP PICKS — Niveau 1 ======
+   Filtre intelligent automatique des meilleures opportunités du jour.
+   Basé sur des critères objectifs (PAS de prédiction d'IA) :
+    - Confiance ≥ 8/10 (critères : 4/4 books, faible variance ligne, edge raisonnable)
+    - Couverture 4/4 books (max liquidité, plus stable)
+    - Début entre 2h et 48h (le sweet spot : assez de temps pour placer, pas trop loin)
+    - Soit arb ≥ 2% soit value edge ≥ 5%
+   Dédoublonne par event+market et limite aux 5 meilleurs.
+*/
+function isTopPick(opp) {
+  if (opp.confidence < 8) return false;
+  if (opp.book_count < 4) return false;
+  const hoursToStart = (new Date(opp.start_time) - Date.now()) / 3600000;
+  if (hoursToStart < 2 || hoursToStart > 48) return false;
+  // Au moins un signal fort : arb solide OU edge value généreux
+  if (opp.arb_pct >= 2 || opp.max_edge >= 5) return true;
+  return false;
+}
+
+function getTopPicks(arbs, values) {
+  const seen = new Set();
+  const picks = [];
+  // Mélange arbs + values, on les marque pour les distinguer à l'affichage
+  const candidates = [
+    ...arbs.map(o => ({ ...o, _kind: "arb" })),
+    ...values.map(o => ({ ...o, _kind: "value" })),
+  ].filter(isTopPick);
+  // Tri : confiance desc, puis profit potentiel (arb_pct ou max_edge) desc
+  candidates.sort((a,b) => {
+    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    const aSignal = a._kind === "arb" ? a.arb_pct : a.max_edge;
+    const bSignal = b._kind === "arb" ? b.arb_pct : b.max_edge;
+    return bSignal - aSignal;
+  });
+  // Dédoublonne (même event+market = on garde le meilleur, généralement l'arb)
+  for (const opp of candidates) {
+    const key = opp.event + "|" + opp.market;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    picks.push(opp);
+    if (picks.length >= 5) break;
+  }
+  return picks;
 }
 
 function kellyStake(odds, fairOdds, bankroll, fraction=0.25) {
@@ -1156,6 +1202,26 @@ function renderScannerTab(enabledCount) {
     ${state.warning ? `<div class="bg-amber-950 border border-amber-800 text-amber-300 rounded p-3 mb-4 text-sm">⚠ ${escapeHtml(state.warning)}</div>`:""}
     ${state.error ? `<div class="bg-red-950 border border-red-800 text-red-300 rounded p-3 mb-4 text-sm">⚠ ${escapeHtml(state.error)}</div>`:""}
 
+    <!-- 🔥 TOP PICKS — Niveau 1 -->
+    ${state.lastUpdate && state.topPicks?.length > 0 ? `
+      <section class="bg-gradient-to-br from-emerald-900/30 to-cyan-900/30 border border-emerald-700/50 rounded-lg p-4 mb-6">
+        <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <div>
+            <h2 class="text-lg font-bold text-emerald-300 flex items-center gap-2">🔥 Top Picks du moment <span class="text-xs bg-emerald-700/50 px-2 py-0.5 rounded font-normal">${state.topPicks.length}</span></h2>
+            <p class="text-xs text-slate-400">Sélection auto des opportunités les plus solides : confiance ≥ 8/10, 4/4 books, début entre 2h et 48h. Pas de prédiction magique, juste les meilleurs paris à ne pas rater.</p>
+          </div>
+        </div>
+        <div class="grid gap-3">
+          ${state.topPicks.map(opp => renderTopPickCard(opp)).join("")}
+        </div>
+      </section>
+    ` : state.lastUpdate ? `
+      <section class="bg-slate-900 border border-slate-800 rounded-lg p-4 mb-6 text-center">
+        <p class="text-sm text-slate-400">🔥 <strong>Aucun Top Pick</strong> pour le moment.</p>
+        <p class="text-xs text-slate-500 mt-1">Les Top Picks demandent : confiance ≥ 8 + 4/4 books + début entre 2h et 48h + arb ≥ 2% ou edge ≥ 5%. Critères stricts pour ne te montrer que le top du top.</p>
+      </section>
+    ` : ""}
+
     <!-- ARBITRAGES -->
     <h3 class="text-sm font-semibold text-slate-300 mb-2 flex items-center gap-2">
       <span>🎯 Arbitrages purs</span>
@@ -1209,6 +1275,80 @@ function renderScannerTab(enabledCount) {
       </div>
       <button id="clearHistory" class="mt-2 text-xs text-slate-500 hover:text-red-400">Effacer tout l'historique</button>
     </details>` : ""}
+  `;
+}
+
+/**
+ * Carte compacte pour la section Top Picks. Affichage condensé avec
+ * raisons explicites du choix, et boutons Quick Bet directs.
+ */
+function renderTopPickCard(opp) {
+  const isArb = opp._kind === "arb";
+  const {stakes, profit, roi} = calculateStakes(opp.best_odds, state.stake);
+  const hoursToStart = (new Date(opp.start_time) - Date.now()) / 3600000;
+  const reasons = [
+    `${opp.book_count}/4 books`,
+    `conf ${opp.confidence}/10`,
+    isArb ? `arb +${opp.arb_pct}%` : `edge +${opp.max_edge}%`,
+    hoursToStart >= 24 ? `dans ${Math.floor(hoursToStart/24)}j` : `dans ${Math.floor(hoursToStart)}h`,
+  ];
+  const cols = Object.keys(opp.best_odds).length > 2 ? "3" : "2";
+
+  return `
+    <div class="bg-slate-900 border-2 ${isArb?'border-emerald-500':'border-cyan-500'} rounded-lg p-4 relative overflow-hidden">
+      <div class="absolute top-0 right-0 ${isArb?'bg-emerald-500':'bg-cyan-500'} text-slate-950 text-[10px] font-bold px-2 py-0.5 rounded-bl">
+        ${isArb ? "🎯 ARB" : "💎 VALUE"}
+      </div>
+      <div class="flex justify-between items-start gap-3 mb-2">
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2 mb-1 flex-wrap text-xs">
+            <span class="text-slate-300">${opp.sport_emoji||""} ${escapeHtml(opp.sport)}</span>
+            <span class="text-slate-500">·</span>
+            <span class="text-slate-400">${escapeHtml(opp.market_label||opp.market)}</span>
+            <span class="text-slate-500">·</span>
+            <span class="text-slate-400">${new Date(opp.start_time).toLocaleString("fr-FR",{weekday:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</span>
+          </div>
+          <h3 class="font-bold text-base">${escapeHtml(opp.event)}</h3>
+          <p class="text-xs text-emerald-400 mt-1">✓ ${reasons.join(" · ")}</p>
+        </div>
+        <div class="text-right shrink-0">
+          <div class="text-2xl font-bold ${isArb?'text-emerald-300':'text-cyan-300'}">
+            ${isArb ? `+${opp.arb_pct}%` : `+${opp.max_edge}%`}
+          </div>
+          ${isArb ? `<div class="text-[10px] text-slate-500">profit ${profit>0?'+':''}${profit}€ sur ${state.stake}€</div>` : ""}
+        </div>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-${cols} gap-2 mt-3">
+        ${Object.entries(opp.best_odds).map(([k,v]) => {
+          const fair = opp.fair_odds?.[k];
+          const edge = opp.edges?.[k];
+          const kelly = fair && !isArb ? kellyStake(v, fair, state.bankroll, state.kellyFraction) : 0;
+          const recommendedStake = isArb ? stakes[k] : (kelly > 0 ? kelly : 0);
+          const showKellyOrStake = isArb ? `<strong>${stakes[k]}€</strong>` : (kelly > 0 ? `<strong class="text-amber-400">${kelly}€ (Kelly)</strong>` : "");
+          return `
+            <div class="bg-slate-800 rounded p-2 flex justify-between items-center gap-2">
+              <div class="min-w-0 flex-1">
+                <div class="font-medium truncate text-sm">${escapeHtml(k)}</div>
+                <div class="text-[11px] text-slate-400 flex items-center gap-1 flex-wrap">
+                  <a href="${BOOK_URLS[opp.book_keys[k]]||'#'}" target="_blank" rel="noopener" class="px-1.5 py-0.5 rounded text-[10px] ${BOOK_COLORS[opp.book_keys[k]]||'bg-slate-700'} hover:underline">${escapeHtml(opp.books[k])} ↗</a>
+                  ${showKellyOrStake ? `<span>${showKellyOrStake}</span>` : ""}
+                  ${edge>0 && !isArb ? `<span class="text-cyan-400">+${edge}%</span>` : ""}
+                </div>
+              </div>
+              <div class="text-xl font-bold">${v}</div>
+              <button class="quick-bet text-[10px] bg-emerald-600/30 hover:bg-emerald-600/60 text-emerald-200 px-2 py-1 rounded shrink-0"
+                data-opp='${escapeAttr(JSON.stringify({
+                  sport: opp.sport, event: opp.event, market: opp.market,
+                  selection: k, book: opp.books[k], odds: v,
+                  stake: recommendedStake, type: isArb ? "arb" : "value",
+                  confidence: opp.confidence, opportunity_id: opp.id,
+                  sport_key: opp.sport_key, event_start: opp.start_time,
+                }))}'>+ Tracker</button>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
   `;
 }
 
@@ -1927,6 +2067,7 @@ async function refresh() {
     const result = await getTopOpportunities(state.apiKey);
     state.data = result.arbs;
     state.valueBets = result.values;
+    state.topPicks = getTopPicks(result.arbs, result.values); // Niveau 1 : Top Picks
     state.lastUpdate = new Date();
     state.scanCount++;
     save("arb_scan_count", state.scanCount);
