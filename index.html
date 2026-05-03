@@ -1968,7 +1968,7 @@ async function fetchParisDuJour() {
   state.pdjLoading = true;
   state.pdjError = null;
   render();
-  const enabled = SPORTS.filter(s => state.enabled[s.key]);
+  const enabled = SPORTS.filter(s => state.enabledSports[s.key]);
   if (!enabled.length) {
     state.pdjError = "Aucun sport activé. Active des sports dans l'onglet Scanner.";
     state.pdjLoading = false;
@@ -2052,7 +2052,7 @@ function renderParisDuJourTab() {
     ? new Date(state.pdjLastFetch).toLocaleTimeString("fr-FR")
     : "—";
 
-  const enabledCount = SPORTS.filter(s => state.enabled[s.key]).length;
+  const enabledCount = SPORTS.filter(s => state.enabledSports[s.key]).length;
 
   return `
     <!-- BARRE COMMANDES -->
